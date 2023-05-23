@@ -23,6 +23,9 @@
 #include <float.h>
 #include <limits.h>
 
+int64_t op_time[50];
+int64_t thread_time[48];
+
 // if C99 - static_assert is noop
 // ref: https://stackoverflow.com/a/53923785/4039976
 #ifndef static_assert
@@ -472,6 +475,36 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE / sizeof(float);
 // quantization
 //
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+// Load 256 bits and transform each abcd_efgh to 0000_abcd_0000_efgh
+static inline __m512i dequantize_64x4_2_64x8(const uint8_t* rsi) {
+    // Load 32 bytes from memory
+    const __m256i int4s = _mm256_loadu_si256( ( const __m256i* )rsi );
+
+    const __m512i mask = _mm512_set1_epi8(0xF);
+
+    // Expand bytes into uint16_t values
+    const __m512i bytes = _mm512_cvtepu8_epi16( int4s );      // 0000_0000_abcd_efgh
+
+    // _mm512_srli_epi16 is slower than _mm512_srli_epi32 on SPR:
+    // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#techs=AVX_ALL,AVX_512&text=_mm512_slli_epi
+    const __m512i bytes_sll4 = _mm512_slli_epi32(bytes, 4);   // 0000_abcd_efgh_0000
+
+    return _mm512_and_si512(mask, _mm512_or_si512(bytes, bytes_sll4));
+}
+
+// Move bits within 16-bit lanes from 0000_abcd_0000_efgh into 0000_0000_abcd_efgh
+static inline __m256i quantize_64x8_2_64x4( __m512i bytes ) {
+    // _mm512_srli_epi16 is slower than _mm512_srli_epi32 on SPR:
+    // https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#techs=AVX_ALL,AVX_512&text=_mm512_srli_epi
+    const __m512i bytes_srl4 = _mm512_srli_epi32(bytes, 4);     // 0000_0000_abcd_0000 and efgh_0000_abcd_0000
+    bytes = _mm512_mask_add_epi8(bytes, 0x5555555555555555, bytes, bytes_srl4);     // 0000_0000_abcd_efgh
+    // or you can simply use _mm512_add_epi8/_mm512_or_si512 instead of _mm512_mask_add_epi8, _mm512_cvtepi16_epi8 will truncate the high 8 bits
+    // bytes = _mm512_add_epi8(bytes, bytes_srl4);  // 0000_abcd_abcd_efgh and efgh_abcd_abcd_efgh
+    return _mm512_cvtepi16_epi8( bytes );
+}
+#endif
+
 #if __AVX__ || __AVX2__ || __AVX512F__
                                                                                                                         // Unpack 16 4-bit fields into 16 bytes
 // The output vector contains 16 bytes, each one in [ 0 .. 15 ] interval
@@ -781,14 +814,22 @@ int32x4_t vcvtnq_s32_f32(float32x4_t v) {
 #endif
 
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#define QK4_0 64
+#else
 #define QK4_0 32
+#endif
 typedef struct {
     float d;          // delta
     uint8_t qs[QK4_0 / 2];  // nibbles / quants
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(float) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#define QK4_1 64
+#else
 #define QK4_1 32
+#endif
 typedef struct {
     float d;          // delta
     float m;          // min
@@ -822,7 +863,11 @@ typedef struct {
 static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK5_1 / 2,
               "wrong q5_1 block size/padding");
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#define QK8_0 64
+#else
 #define QK8_0 32
+#endif
 typedef struct {
     float d;          // delta
     int8_t qs[QK8_0];  // quants
@@ -837,6 +882,55 @@ typedef struct {
     int8_t qs[QK8_1];  // quants
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 3 * sizeof(float) + QK8_1, "wrong q8_1 block size/padding");
+
+void print_m256i(__m256i a) {
+    printf("%08X ", _mm256_extract_epi32(a, 7));
+    printf("%08X ", _mm256_extract_epi32(a, 6));
+    printf("%08X ", _mm256_extract_epi32(a, 5));
+    printf("%08X ", _mm256_extract_epi32(a, 4));
+    printf("%08X ", _mm256_extract_epi32(a, 3));
+    printf("%08X ", _mm256_extract_epi32(a, 2));
+    printf("%08X ", _mm256_extract_epi32(a, 1));
+    printf("%08X ", _mm256_extract_epi32(a, 0));
+    printf("\n");
+}
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+void print_m512i(__m512i a) {
+    print_m256i(_mm512_extracti32x8_epi32(a, 1));
+    print_m256i(_mm512_castsi512_si256(a));
+    printf("\n");
+}
+#endif
+
+void print_m256f(__m256i a) {
+    int f = 0;
+    f = _mm256_extract_epi32(a, 7);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 6);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 5);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 4);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 3);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 2);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 1);
+    printf("%f ", *(float*)&f);
+    f = _mm256_extract_epi32(a, 0);
+    printf("%f ", *(float*)&f);
+    printf("\n");
+}
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+void print_m512f(__m512i a) {
+    print_m256f(_mm512_extracti32x8_epi32(a, 1));
+    print_m256f(_mm512_castsi512_si256(a));
+    printf("\n");
+}
+#endif
 
 // reference implementation for deterministic creation of model files
 static void quantize_row_q4_0_reference(const float *restrict x, block_q4_0 *restrict y, int k) {
@@ -1529,8 +1623,7 @@ static void quantize_row_q8_0(const float *restrict x, void *restrict vy, int k)
     assert(k % QK8_0 == 0);
     const int nb = k / QK8_0;
 
-    block_q8_0 *restrict
-    y = vy;
+    block_q8_0 *restrict y = vy;
 
 #if defined(__ARM_NEON)
                                                                                                                             for (int i = 0; i < nb; i++) {
@@ -1562,8 +1655,58 @@ static void quantize_row_q8_0(const float *restrict x, void *restrict vy, int k)
             y[i].qs[4*l + 3] = vgetq_lane_s32(vi, 3);
         }
     }
+#elif defined(__AVX512F__) && defined(__AVX512VNNI__)
+    for (int i = 0; i < nb; i++) {
+        // Load elements into 4 AVX vectors
+        __m512 v0 = _mm512_loadu_ps( x );
+        __m512 v1 = _mm512_loadu_ps( x + 16 );
+        __m512 v2 = _mm512_loadu_ps( x + 32 );
+        __m512 v3 = _mm512_loadu_ps( x + 48 );
+        x += 64;
+
+        // Compute max(abs(e)) for the block
+        // todo
+        const __m512 signBit = _mm512_set1_ps( -0.0f );
+        __m512 maxAbs = _mm512_andnot_ps( signBit, v0 );
+        maxAbs = _mm512_max_ps( maxAbs, _mm512_andnot_ps( signBit, v1 ) );
+        maxAbs = _mm512_max_ps( maxAbs, _mm512_andnot_ps( signBit, v2 ) );
+        maxAbs = _mm512_max_ps( maxAbs, _mm512_andnot_ps( signBit, v3 ) );
+
+        const float maxScalar = _mm512_reduce_max_ps(maxAbs);
+
+        // Quantize these floats
+        const float d = maxScalar / 127.f;
+        y[i].d = d;
+        const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
+        const __m512 mul = _mm512_set1_ps( id );
+
+        // Apply the multiplier and Round to nearest integer
+        v0 = _mm512_mul_round_ps ( v0, mul, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) );
+        v1 = _mm512_mul_round_ps ( v1, mul, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) );
+        v2 = _mm512_mul_round_ps ( v2, mul, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) );
+        v3 = _mm512_mul_round_ps ( v3, mul, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC) );
+
+        // Convert floats to integers
+        __m512i i0 = _mm512_cvtps_epi32( v0 );
+        __m512i i1 = _mm512_cvtps_epi32( v1 );
+        __m512i i2 = _mm512_cvtps_epi32( v2 );
+        __m512i i3 = _mm512_cvtps_epi32( v3 );
+
+        i0 = _mm512_packs_epi32( i0, i1 );	// 0-3, 16-19, 4-7, 20-23, 8-11, 24-17, 12-15, 28-31
+        i2 = _mm512_packs_epi32( i2, i3 );	// 32-35, 48-51, 36-39, 52-55, 40-43, 56-59, 44-47, 60-63
+                                            // Convert int16 to int8
+        i0 = _mm512_packs_epi16( i0, i2 );	// 0-3, 16-19, 32-35, 48-51, 4-7, 20-23, 36-39, 52-55, 8-11, 24-17, 40-43, 56-59, 12-15, 28-31, 44-47, 60-63
+
+        // We got our precious signed bytes, but the order is now wrong
+        // These AVX512 pack instructions process 16-byte pieces independently
+        // The following instruction is fixing the order
+        const __m512i perm = _mm512_setr_epi32( 0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15 );
+        i0 = _mm512_permutexvar_epi32( perm, i0 );
+
+        _mm512_storeu_si512(( __m512i* )y[i].qs, i0);
+    }
 #elif defined(__AVX2__) || defined(__AVX__)
-                                                                                                                            for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < nb; i++) {
         // Load elements into 4 AVX vectors
         __m256 v0 = _mm256_loadu_ps( x );
         __m256 v1 = _mm256_loadu_ps( x + 8 );
@@ -1698,7 +1841,7 @@ static void quantize_row_q8_1(const float *restrict x, void *restrict vy, int k)
     y = vy;
 
 #if defined(__ARM_NEON)
-                                                                                                                            for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < nb; i++) {
         float32x4_t srcv [8];
         float32x4_t asrcv[8];
         float32x4_t amaxv[8];
@@ -1753,7 +1896,7 @@ static void quantize_row_q8_1(const float *restrict x, void *restrict vy, int k)
         y[i].s1 = d * sum1;
     }
 #elif defined(__AVX2__) || defined(__AVX__)
-                                                                                                                            for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < nb; i++) {
         // Load elements into 4 AVX vectors
         __m256 v0 = _mm256_loadu_ps( x );
         __m256 v1 = _mm256_loadu_ps( x + 8 );
@@ -1857,11 +2000,47 @@ static void dequantize_row_q4_0(const void *restrict vx, float *restrict y, int 
     assert(k % QK4_0 == 0);
     const int nb = k / QK4_0;
 
-    const block_q4_0 *restrict
-    x = vx;
+    const block_q4_0 *restrict x = vx;
 
-#if defined(__AVX2__)
-                                                                                                                            for (int i = 0; i < nb; i++) {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+    for (int i = 0; i < nb; i++) {
+        const __m512 d_v = _mm512_set1_ps(x[i].d);
+        // Load 64x4-bit integers into 64x8-bit integers
+        const uint8_t * restrict pp = x[i].qs;
+        __m512i vi8 = dequantize_64x4_2_64x8(pp);
+
+        // Subtract 8 from the integers
+        vi8 = _mm512_sub_epi8(vi8, _mm512_set1_epi8(8));
+
+        // Convert 8-bit int -> float 32
+        const __m128i vi8_0 = _mm512_castsi512_si128(vi8);
+        const __m128i vi8_1 = _mm512_extracti32x4_epi32(vi8, 1);
+        const __m128i vi8_2 = _mm512_extracti32x4_epi32(vi8, 2);
+        const __m128i vi8_3 = _mm512_extracti32x4_epi32(vi8, 3);
+
+        const __m512i vi32_0 = _mm512_cvtepi8_epi32(vi8_0);
+        const __m512i vi32_1 = _mm512_cvtepi8_epi32(vi8_1);
+        const __m512i vi32_2 = _mm512_cvtepi8_epi32(vi8_2);
+        const __m512i vi32_3 = _mm512_cvtepi8_epi32(vi8_3);
+
+        __m512 vf32_0 = _mm512_cvtepi32_ps(vi32_0);
+        __m512 vf32_1 = _mm512_cvtepi32_ps(vi32_1);
+        __m512 vf32_2 = _mm512_cvtepi32_ps(vi32_2);
+        __m512 vf32_3 = _mm512_cvtepi32_ps(vi32_3);
+
+        // Scale and store
+        vf32_0 = _mm512_mul_ps(vf32_0, d_v);
+        vf32_1 = _mm512_mul_ps(vf32_1, d_v);
+        vf32_2 = _mm512_mul_ps(vf32_2, d_v);
+        vf32_3 = _mm512_mul_ps(vf32_3, d_v);
+
+        _mm512_storeu_ps(y + i * QK4_0, vf32_0);
+        _mm512_storeu_ps(y + i * QK4_0 + 16, vf32_1);
+        _mm512_storeu_ps(y + i * QK4_0 + 32, vf32_2);
+        _mm512_storeu_ps(y + i * QK4_0 + 48, vf32_3);
+    }
+#elif defined(__AVX2__)
+    for (int i = 0; i < nb; i++) {
         // scale factor
         const __m256 d_v = _mm256_broadcast_ss(&x[i].d);
 
@@ -1977,11 +2156,51 @@ static void dequantize_row_q4_1(const void *restrict vx, float *restrict y, int 
     assert(k % QK4_1 == 0);
     const int nb = k / QK4_1;
 
-    const block_q4_1 *restrict
-    x = vx;
+    const block_q4_1 *restrict x = vx;
 
-#if defined(__AVX2__)
-                                                                                                                            for (int i = 0; i < nb; i++) {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+    for (int i = 0; i < nb; i++) {
+        const __m512 d_v = _mm512_set1_ps(x[i].d);
+        const __m512 m_v = _mm512_set1_ps(x[i].m);
+
+        // Load 64x4-bit integers into 64x8-bit integers
+        const uint8_t * restrict pp = x[i].qs;
+        __m512i vi8 = dequantize_64x4_2_64x8(pp);
+
+        // Convert 8-bit int -> float 32
+        const __m128i vi8_0 = _mm512_castsi512_si128(vi8);
+        const __m128i vi8_1 = _mm512_extracti32x4_epi32(vi8, 1);
+        const __m128i vi8_2 = _mm512_extracti32x4_epi32(vi8, 2);
+        const __m128i vi8_3 = _mm512_extracti32x4_epi32(vi8, 3);
+
+        const __m512i vi32_0 = _mm512_cvtepi8_epi32(vi8_0);
+        const __m512i vi32_1 = _mm512_cvtepi8_epi32(vi8_1);
+        const __m512i vi32_2 = _mm512_cvtepi8_epi32(vi8_2);
+        const __m512i vi32_3 = _mm512_cvtepi8_epi32(vi8_3);
+
+        __m512 vf32_0 = _mm512_cvtepi32_ps(vi32_0);
+        __m512 vf32_1 = _mm512_cvtepi32_ps(vi32_1);
+        __m512 vf32_2 = _mm512_cvtepi32_ps(vi32_2);
+        __m512 vf32_3 = _mm512_cvtepi32_ps(vi32_3);
+
+        // Scale and store
+        vf32_0 = _mm512_mul_ps(vf32_0, d_v);
+        vf32_1 = _mm512_mul_ps(vf32_1, d_v);
+        vf32_2 = _mm512_mul_ps(vf32_2, d_v);
+        vf32_3 = _mm512_mul_ps(vf32_3, d_v);
+
+        vf32_0 = _mm512_add_ps(vf32_0, m_v);
+        vf32_1 = _mm512_add_ps(vf32_1, m_v);
+        vf32_2 = _mm512_add_ps(vf32_2, m_v);
+        vf32_3 = _mm512_add_ps(vf32_3, m_v);
+
+        _mm512_storeu_ps(y + i * QK4_1, vf32_0);
+        _mm512_storeu_ps(y + i * QK4_1 + 16, vf32_1);
+        _mm512_storeu_ps(y + i * QK4_1 + 32, vf32_2);
+        _mm512_storeu_ps(y + i * QK4_1 + 48, vf32_3);
+    }
+#elif defined(__AVX2__)
+    for (int i = 0; i < nb; i++) {
         const __m256 d_v = _mm256_broadcast_ss(&x[i].d);
         const __m256 d_m = _mm256_broadcast_ss(&x[i].m);
 
@@ -2884,10 +3103,8 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float *restrict s, const void *r
     assert(n % QK8_0 == 0);
     assert(nb % 2 == 0);
 
-    const block_q4_0 *restrict
-    x = vx;
-    const block_q8_0 *restrict
-    y = vy;
+    const block_q4_0 *restrict x = vx;
+    const block_q8_0 *restrict y = vy;
 
 #if defined(__ARM_NEON)
                                                                                                                             float32x4_t sumv0 = vdupq_n_f32(0.0f);
@@ -2958,8 +3175,36 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float *restrict s, const void *r
     }
 
     *s = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+#elif defined(__AVX512F__) && defined(__AVX512VNNI__)
+    // Initialize accumulator with zeros
+    __m512 acc = _mm512_setzero_ps();
+
+    const __m512i off = _mm512_set1_epi8(8);
+    const __m512i zeros = _mm512_setzero_epi32();
+
+    // Main loop
+    for (int i = 0; i < nb; ++i) {
+        // /* Compute combined scale for the block */
+        const __m512 d = _mm512_set1_ps(x[i].d * y[i].d);
+
+        const __m512i bx = dequantize_64x4_2_64x8(x[i].qs);
+        const __m512i by = _mm512_loadu_si512((const __m512i *)y[i].qs);
+
+        // xy_q[0] :i32 = sum( (bx[i] - 8) * by[i] ) i :0->3
+        const __m512i q_off = _mm512_dpbusd_epi32(zeros, off, by);
+        __m512i xy_q = _mm512_dpbusd_epi32(zeros, bx, by);
+        xy_q = _mm512_sub_epi32(xy_q, q_off);
+
+        /* Convert to vectore of 8 int32_t to 8 floats */
+        const __m512 q = _mm512_cvtepi32_ps( xy_q );
+
+        /* Multiply q with scale and accumulate */
+        acc = _mm512_fmadd_ps( d, q, acc );
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
 #elif defined(__AVX2__)
-                                                                                                                            // Initialize accumulator with zeros
+    // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
     // Main loop
@@ -8657,8 +8902,8 @@ static void ggml_compute_forward_mul_mat_f16_f32(
         const struct ggml_tensor *src0,
         const struct ggml_tensor *src1,
         struct ggml_tensor *dst) {
-    int64_t t0 = ggml_perf_time_us();
-    UNUSED(t0);
+    // int64_t t0 = ggml_perf_time_us();
+    // UNUSED(t0);
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -8873,8 +9118,8 @@ static void ggml_compute_forward_mul_mat_q_f32(
         const struct ggml_tensor *src0,
         const struct ggml_tensor *src1,
         struct ggml_tensor *dst) {
-    int64_t t0 = ggml_perf_time_us();
-    UNUSED(t0);
+    // int64_t t0 = ggml_perf_time_us();
+    // UNUSED(t0);
 
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
@@ -9088,6 +9333,7 @@ static void ggml_compute_forward_mul_mat(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
         struct ggml_tensor * dst) {
+    int64_t st = ggml_time_us();
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
@@ -9111,6 +9357,11 @@ static void ggml_compute_forward_mul_mat(
             GGML_ASSERT(false);
         }
             break;
+    }
+    if (params->type == GGML_TASK_INIT) {
+        thread_time[47] += ggml_time_ms() - st;
+    } else {
+        thread_time[params->ith] += ggml_time_ms() - st;
     }
 }
 
@@ -11809,7 +12060,7 @@ typedef int ggml_lock_t;
 
 typedef pthread_t ggml_thread_t;
 
-#define ggml_thread_create pthread_create
+// #define ggml_thread_create pthread_create
 #define ggml_thread_join   pthread_join
 
 #endif
@@ -11817,11 +12068,9 @@ typedef pthread_t ggml_thread_t;
 struct ggml_compute_state_shared {
     ggml_lock_t spin;
 
-    int n_threads;
-
-    // synchronization primitives
-    atomic_int  n_ready;
-    atomic_bool has_work;
+    atomic_int n_done;
+    atomic_bool start;
+    atomic_bool finish;
     atomic_bool stop; // stop all threads
 };
 
@@ -11834,37 +12083,66 @@ struct ggml_compute_state {
     struct ggml_compute_state_shared * shared;
 };
 
+#if defined(_WIN32)
+static int ggml_thread_create(pthread_t *thread,
+                              void *unused,
+                              void *(*start_routine) (void *),
+                              void *arg)
+{
+    (void) unused;
+    if (pthread_create(thread, NULL, start_routine, arg) != 0) {
+        return -1;
+    }
+
+    int n = ((struct ggml_compute_state*) arg)->params.ith;
+    DWORD_PTR new_affinity_mask = 1 << n;
+    DWORD_PTR prev_affinity_mask = SetThreadAffinityMask(*thread, new_affinity_mask);
+    if (prev_affinity_mask == 0) {
+        return -1;
+    }
+    return 0;
+}
+
+#elif defined(__linux__)
+static int ggml_thread_create(pthread_t *thread,
+                              const pthread_attr_t *_attr,
+                              void *(*start_routine) (void *),
+                              void *arg)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(((struct ggml_compute_state*) arg)->params.ith, &cpuset);
+    pthread_attr_setaffinity_np(&attr, sizeof(cpuset), &cpuset);
+
+    pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+
+    struct sched_param param = {sched_get_priority_max(SCHED_FIFO)};
+    pthread_attr_setschedparam(&attr, &param);
+
+    return pthread_create(thread, &attr, start_routine, arg);
+}
+#endif
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
-    const int n_threads = state->shared->n_threads;
-
     while (true) {
-        if (atomic_fetch_add(&state->shared->n_ready, 1) == n_threads - 1) {
-            atomic_store(&state->shared->has_work, false);
-        } else {
-            while (atomic_load(&state->shared->has_work)) {
-                if (atomic_load(&state->shared->stop)) {
-                    return 0;
-                }
-                ggml_lock_lock  (&state->shared->spin);
-                ggml_lock_unlock(&state->shared->spin);
-            }
-        }
-
-        atomic_fetch_sub(&state->shared->n_ready, 1);
-
-        // wait for work
-        while (!atomic_load(&state->shared->has_work)) {
-            if (atomic_load(&state->shared->stop)) {
-                return 0;
-            }
-            ggml_lock_lock  (&state->shared->spin);
-            ggml_lock_unlock(&state->shared->spin);
+        atomic_fetch_sub(&state->shared->n_done, 1);
+#ifdef __linux__
+        while (!atomic_load_explicit(&state->shared->start, memory_order_relaxed)) {
+#else
+        while (!atomic_load(&state->shared->start)) {
+#endif
+            // wait
+            // ggml_lock_lock(&state->shared->spin);
+            // ggml_lock_unlock(&state->shared->spin);
         }
 
         // check if we should stop
-        if (atomic_load(&state->shared->stop)) {
+        if (state->shared->stop) {
             break;
         }
 
@@ -11872,8 +12150,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             if (state->params.ith < state->params.nth) {
                 ggml_compute_forward(&state->params, state->node);
             }
-
             state->node = NULL;
+            atomic_fetch_add(&state->shared->n_done, 1);
+#ifdef __linux__
+            while(!atomic_load_explicit(&state->shared->finish, memory_order_relaxed)) {
+#else
+            while(!atomic_load(&state->shared->finish)) {
+#endif
+                // wait
+                // ggml_lock_lock(&state->shared->spin);
+                // ggml_lock_unlock(&state->shared->spin);
+            }
         } else {
             break;
         }
@@ -11886,20 +12173,18 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
     const int n_threads = cgraph->n_threads;
 
     struct ggml_compute_state_shared state_shared = {
-            /*.spin      =*/ GGML_LOCK_INITIALIZER,
-            /*.n_threads =*/ n_threads,
-            /*.n_ready   =*/ 0,
-            /*.has_work  =*/ false,
-            /*.stop      =*/ false,
+        /*.spin      =*/ GGML_LOCK_INITIALIZER,
+        /* n_done    =*/ n_threads - 1,
+        /* start     =*/ false,
+        /* finish    =*/ false,
+        /* stop      =*/ false,
     };
+
     struct ggml_compute_state * workers = n_threads > 1 ? alloca(sizeof(struct ggml_compute_state)*(n_threads - 1)) : NULL;
 
     // create thread pool
     if (n_threads > 1) {
         ggml_lock_init(&state_shared.spin);
-
-        atomic_store(&state_shared.has_work, true);
-
         for (int j = 0; j < n_threads - 1; j++) {
             workers[j] = (struct ggml_compute_state) {
                     .thrd   = 0,
@@ -11920,6 +12205,17 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
         }
     }
 
+#if defined(_WIN32)
+    pthread_t self = GetCurrentThread();
+    SetThreadAffinityMask(self, 1);
+#elif defined(__linux__)
+    pthread_t self = pthread_self();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    pthread_setaffinity_np(self, sizeof(cpuset), &cpuset);
+#endif
+
     // initialize tasks + work buffer
     {
         size_t work_size = 0;
@@ -11931,7 +12227,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
             switch (node->op) {
                 case GGML_OP_CPY:
                 case GGML_OP_DUP: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
 
                     size_t cur = 0;
                     if (ggml_is_quantized(node->type)) {
@@ -11941,18 +12237,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     work_size = MAX(work_size, cur);
                 }
                     break;
-                case GGML_OP_ADD: {
-                    node->n_tasks = n_threads;
-
-                    size_t cur = 0;
-
-                    if (ggml_is_quantized(node->src0->type)) {
-                        cur = GGML_TYPE_SIZE[GGML_TYPE_F32] * node->src0->ne[0] * n_threads;
-                    }
-
-                    work_size = MAX(work_size, cur);
-                }
-                    break;
+                case GGML_OP_ADD:
                 case GGML_OP_SUB:
                 case GGML_OP_MUL:
                 case GGML_OP_DIV:
@@ -11970,20 +12255,20 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 }
                     break;
                 case GGML_OP_GELU: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = 1;
                 }
                     break;
                 case GGML_OP_SILU: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
                 }
                     break;
                 case GGML_OP_NORM:
                 case GGML_OP_RMS_NORM: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
                 }
                     break;
                 case GGML_OP_MUL_MAT: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
 
                     // TODO: use different scheduling for different matrix sizes
                     //const int nr0 = ggml_nrows(node->src0);
@@ -11995,7 +12280,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     size_t cur = 0;
 
 #if defined(GGML_USE_CUBLAS)
-                                                                                                                                            if (ggml_cuda_can_mul_mat(node->src0, node->src1, node)) {
+                        if (ggml_cuda_can_mul_mat(node->src0, node->src1, node)) {
                             node->n_tasks = 1; // TODO: this actually is doing nothing
                                                 //       the threads are still spinning
                             cur = ggml_cuda_mul_mat_get_wsize(node->src0, node->src1, node);
@@ -12004,7 +12289,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
 #endif
                     if (node->src0->type == GGML_TYPE_F16 && node->src1->type == GGML_TYPE_F32) {
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CLBLAST)
-                                                                                                                                                if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
+                            if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                 node->n_tasks = 1; // TODO: this actually is doing nothing
                                                    //       the threads are still spinning
                                 // here we need memory just for single 2D matrix from src0
@@ -12018,13 +12303,13 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     } else if (node->src0->type == GGML_TYPE_F32 && node->src1->type == GGML_TYPE_F32) {
                         cur = 0;
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CLBLAST)
-                                                                                                                                                if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
+                            if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                 node->n_tasks = 1;
                             }
 #endif
                     } else if (ggml_is_quantized(node->src0->type) && node->src1->type == GGML_TYPE_F32) {
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CLBLAST)
-                                                                                                                                                if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
+                            if (ggml_compute_forward_mul_mat_use_blas(node->src0, node->src1, node)) {
                                 node->n_tasks = 1;
                                 cur = GGML_TYPE_SIZE[GGML_TYPE_F32]*(node->src0->ne[0]*node->src0->ne[1]);
                             } else
@@ -12041,7 +12326,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 }
                     break;
                 case GGML_OP_SCALE: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
                 }
                     break;
                 case GGML_OP_CONT:
@@ -12055,11 +12340,11 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 }
                     break;
                 case GGML_OP_SOFT_MAX: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
                 }
                     break;
                 case GGML_OP_ROPE: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
                 }
                     break;
                 case GGML_OP_ALIBI: {
@@ -12068,7 +12353,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     break;
                 case GGML_OP_CONV_1D_1S:
                 case GGML_OP_CONV_1D_2S: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
 
                     GGML_ASSERT(node->src0->ne[3] == 1);
                     GGML_ASSERT(node->src1->ne[2] == 1);
@@ -12097,7 +12382,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 }
                     break;
                 case GGML_OP_FLASH_ATTN: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
 
                     size_t cur = 0;
 
@@ -12117,7 +12402,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                 }
                     break;
                 case GGML_OP_FLASH_FF: {
-                    node->n_tasks = n_threads;
+                    node->n_tasks = n_threads - 1;
 
                     size_t cur = 0;
 
@@ -12175,6 +12460,8 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
         //    continue;
         //}
 
+        int64_t st = ggml_time_ms();
+
         const int64_t perf_node_start_cycles  = ggml_perf_cycles();
         const int64_t perf_node_start_time_us = ggml_perf_time_us();
 
@@ -12191,129 +12478,117 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
 
         // COMPUTE
         if (node->n_tasks > 1) {
-            if (atomic_fetch_add(&state_shared.n_ready, 1) == n_threads - 1) {
-                atomic_store(&state_shared.has_work, false);
-            }
-
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
-            // launch thread pool
+            // init task
             for (int j = 0; j < n_threads - 1; j++) {
                 workers[j].params = (struct ggml_compute_params) {
-                        .type  = GGML_TASK_COMPUTE,
-                        .ith   = j + 1,
-                        .nth   = node->n_tasks,
-                        .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
-                        .wdata = cgraph->work ? cgraph->work->data : NULL,
+                    .type  = GGML_TASK_COMPUTE,
+                    .ith   = j,
+                    .nth   = node->n_tasks,
+                    .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
+                    .wdata = cgraph->work ? cgraph->work->data : NULL,
                 };
                 workers[j].node = node;
             }
 
-            atomic_fetch_sub(&state_shared.n_ready, 1);
-
-            while (atomic_load(&state_shared.n_ready) > 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
-            atomic_store(&state_shared.has_work, true);
-        }
-
-        params.type = GGML_TASK_COMPUTE;
-        ggml_compute_forward(&params, node);
-
-        // wait for thread pool
-        if (node->n_tasks > 1) {
-            if (atomic_fetch_add(&state_shared.n_ready, 1) == n_threads - 1) {
-                atomic_store(&state_shared.has_work, false);
-            }
-
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
-            atomic_fetch_sub(&state_shared.n_ready, 1);
-
-            while (atomic_load(&state_shared.n_ready) != 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-        }
-
-        // FINALIZE
-        if (node->n_tasks > 1) {
-            if (atomic_fetch_add(&state_shared.n_ready, 1) == n_threads - 1) {
-                atomic_store(&state_shared.has_work, false);
-            }
-
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
             // launch thread pool
-            for (int j = 0; j < n_threads - 1; j++) {
-                workers[j].params = (struct ggml_compute_params) {
+#ifdef __linux__
+            while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) > 0) {
+#else
+            while (atomic_load(&state_shared.n_done) > 0) {
+#endif
+                // wait
+                // ggml_lock_lock(&state_shared.spin);
+                // ggml_lock_unlock(&state_shared.spin);
+            }
+            atomic_store(&state_shared.finish, false);
+            atomic_store(&state_shared.start, true);
+
+            // if (node->op == GGML_OP_MUL_MAT) {
+            //     nnnnn += ggml_time_us() - st;
+            // }
+
+            // wait for thread pool
+#ifdef __linux__
+            while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) < node->n_tasks) {
+#else
+            while (atomic_load(&state_shared.n_done) < node->n_tasks) {
+#endif
+                // wait
+                // ggml_lock_lock(&state_shared.spin);
+                // ggml_lock_unlock(&state_shared.spin);
+            }
+            atomic_store(&state_shared.start, false);
+            atomic_store(&state_shared.finish, true);
+        } else {
+            params.type = GGML_TASK_COMPUTE;
+            ggml_compute_forward(&params, node);
+        }
+
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_RMS_NORM && node->op != GGML_OP_CPY && node->op != GGML_OP_ROPE &&
+            node->op != GGML_OP_ADD && node->op != GGML_OP_SILU && node->op != GGML_OP_SCALE && node->op != GGML_OP_MUL) {
+            // FINALIZE
+            if (node->n_tasks > 1) {
+                // init task
+                for (int j = 0; j < n_threads - 1; j++) {
+                    workers[j].params = (struct ggml_compute_params) {
                         .type  = GGML_TASK_FINALIZE,
-                        .ith   = j + 1,
+                        .ith   = j,
                         .nth   = node->n_tasks,
                         .wsize = cgraph->work ? ggml_nbytes(cgraph->work) : 0,
                         .wdata = cgraph->work ? cgraph->work->data : NULL,
-                };
-                workers[j].node = node;
+                    };
+                    workers[j].node = node;
+                }
+
+                // launch thread pool
+#ifdef __linux__
+                while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) > 0) {
+#else
+                while (atomic_load(&state_shared.n_done) > 0) {
+#endif
+                    // wait
+                    // ggml_lock_lock(&state_shared.spin);
+                    // ggml_lock_unlock(&state_shared.spin);
+                }
+                atomic_store(&state_shared.finish, false);
+                atomic_store(&state_shared.start, true);
+
+                // wait for thread pool
+#ifdef __linux__
+                while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) < node->n_tasks) {
+#else
+                while (atomic_load(&state_shared.n_done) < node->n_tasks) {
+#endif
+                    // wait
+                    // ggml_lock_lock(&state_shared.spin);
+                    // ggml_lock_unlock(&state_shared.spin);
+                }
+                atomic_store(&state_shared.start, false);
+                atomic_store(&state_shared.finish, true);
+            } else {
+                params.type = GGML_TASK_FINALIZE;
+                ggml_compute_forward(&params, node);
             }
-
-            atomic_fetch_sub(&state_shared.n_ready, 1);
-
-            while (atomic_load(&state_shared.n_ready) > 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
-            atomic_store(&state_shared.has_work, true);
         }
 
-        params.type = GGML_TASK_FINALIZE;
-        ggml_compute_forward(&params, node);
+        op_time[node->op] += ggml_time_us() - st;
 
-        // wait for thread pool
-        if (node->n_tasks > 1) {
-            if (atomic_fetch_add(&state_shared.n_ready, 1) == n_threads - 1) {
-                atomic_store(&state_shared.has_work, false);
-            }
-
-            while (atomic_load(&state_shared.has_work)) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-
-            atomic_fetch_sub(&state_shared.n_ready, 1);
-
-            while (atomic_load(&state_shared.n_ready) != 0) {
-                ggml_lock_lock  (&state_shared.spin);
-                ggml_lock_unlock(&state_shared.spin);
-            }
-        }
-
+        // total_time[node->op] += ggml_time_us() - st;
         // performance stats (node)
         {
-            int64_t perf_cycles_cur  = ggml_perf_cycles()  - perf_node_start_cycles;
-            int64_t perf_time_us_cur = ggml_perf_time_us() - perf_node_start_time_us;
+            // int64_t perf_cycles_cur  = ggml_perf_cycles()  - perf_node_start_cycles;
+            // int64_t perf_time_us_cur = ggml_perf_time_us() - perf_node_start_time_us;
 
             node->perf_runs++;
-            node->perf_cycles  += perf_cycles_cur;
-            node->perf_time_us += perf_time_us_cur;
+            // node->perf_cycles  += perf_cycles_cur;
+            // node->perf_time_us += perf_time_us_cur;
         }
     }
 
     // join thread pool
     if (n_threads > 1) {
         atomic_store(&state_shared.stop, true);
-        atomic_store(&state_shared.has_work, true);
+        atomic_store(&state_shared.start, true);
 
         for (int j = 0; j < n_threads - 1; j++) {
             int rc = ggml_thread_join(workers[j].thrd, NULL);

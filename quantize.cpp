@@ -13,7 +13,7 @@
 #include <regex>
 
 // TODO: move somewhere else
-#define QK 32
+#define QK 64
 
 // default hparams (Bloom76B)
 struct bloom_hparams {
