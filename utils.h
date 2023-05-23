@@ -94,6 +94,7 @@ gpt_vocab::id bloom_sample_top_p(
         std::vector<gpt_vocab::id> & last_n_tokens,
         double repeat_penalty,
         double top_p,
+        int top_k,
         double temp,
         std::mt19937 & rng);
 
@@ -101,5 +102,5 @@ gpt_vocab::id bloom_sample_top_p(
 // Quantization
 //
 
-size_t ggml_quantize_q4_0(float * src, void * dst, int n, int k, int qk, int64_t * hist);
+size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk, int64_t * hist);
 size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t * hist);

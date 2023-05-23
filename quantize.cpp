@@ -150,7 +150,7 @@ bool bloom_model_quantize(const std::string & fname_inp, const std::string & fna
                 break;
             }
 
-            int32_t nelements = 1;
+            int64_t nelements = 1;
             int32_t ne[2] = { 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
                 finp.read (reinterpret_cast<char *>(&ne[i]), sizeof(ne[i]));
@@ -191,7 +191,7 @@ bool bloom_model_quantize(const std::string & fname_inp, const std::string & fna
                     data_f16.resize(nelements);
                     finp.read(reinterpret_cast<char *>(data_f16.data()), nelements * sizeof(ggml_fp16_t));
                     data_f32.resize(nelements);
-                    for (int i = 0; i < nelements; ++i) {
+                    for (int64_t i = 0; i < nelements; ++i) {
                         data_f32[i] = ggml_fp16_to_fp32(data_f16[i]);
                     }
                 } else {

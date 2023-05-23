@@ -60,7 +60,7 @@ struct bloom_model {
     struct ggml_tensor * output_norm;
     struct ggml_tensor * output_norm_b;
     struct ggml_tensor * output;
-    
+
 
     std::vector<bloom_layer> layers;
 
@@ -177,7 +177,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
     {
         const auto & hparams = model.hparams;
 
-        const int n_embd  = hparams.n_embd;
+        const int64_t n_embd  = hparams.n_embd;
         const int n_layer = hparams.n_layer;
         const int n_ctx   = hparams.n_ctx;
         const int n_vocab = hparams.n_vocab;
@@ -253,7 +253,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
         model.tensors["tok_embeddings.weight"] = model.tok_embeddings;
         model.tensors["norm.weight"]   = model.norm;
         model.tensors["norm.bias"]   = model.norm_b;
-        
+
         model.tensors["output_norm.weight"] = model.output_norm;
         model.tensors["output_norm.bias"] = model.output_norm_b;
         model.tensors["output.weight"] = model.output;
@@ -355,7 +355,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
                     break;
                 }
 
-                int32_t nelements = 1;
+                int64_t nelements = 1;
                 int32_t ne[2] = { 1, 1 };
                 for (int i = 0; i < n_dims; ++i) {
                     fin.read(reinterpret_cast<char *>(&ne[i]), sizeof(ne[i]));
@@ -419,7 +419,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
                 if (n_dims == 1) {
                     if (tensor->ne[0] != ne[0] || tensor->ne[1] != ne[1]) {
                         fprintf(stderr,
-                                "%s: tensor '%s' has wrong shape in model file: got [%lld, %lld], expected [%d, %d]\n",
+                                "%s: tensor '%s' has wrong shape in model file: got [%ld, %ld], expected [%d, %d]\n",
                                 __func__, name.data(), tensor->ne[0], tensor->ne[1], ne[0], ne[1]);
                         return false;
                     }
@@ -427,14 +427,14 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
                     if (split_type == 0) {
                         if (tensor->ne[0]/n_parts != ne[0] || tensor->ne[1] != ne[1]) {
                             fprintf(stderr,
-                                    "%s: tensor '%s' has wrong shape in model file: got [%lld, %lld], expected [%d, %d]\n",
+                                    "%s: tensor '%s' has wrong shape in model file: got [%ld, %ld], expected [%d, %d]\n",
                                     __func__, name.data(), tensor->ne[0] / n_parts, tensor->ne[1], ne[0], ne[1]);
                             return false;
                         }
                     } else {
                         if (tensor->ne[0] != ne[0] || tensor->ne[1]/n_parts != ne[1]) {
                             fprintf(stderr,
-                                    "%s: tensor '%s' has wrong shape in model file: got [%lld, %lld], expected [%d, %d]\n",
+                                    "%s: tensor '%s' has wrong shape in model file: got [%ld, %ld], expected [%d, %d]\n",
                                     __func__, name.data(), tensor->ne[0], tensor->ne[1] / n_parts, ne[0], ne[1]);
                             return false;
                         }
@@ -554,7 +554,7 @@ bool bloom_eval(
 
     const int d_key = n_embd/n_head;
 
-    static size_t buf_size = 512u*1024*1024;
+    static size_t buf_size = 512ul*10000*10000;     // todo!
     static void * buf = malloc(buf_size);
 
     if (mem_per_token > 0 && mem_per_token*N > buf_size) {
@@ -738,7 +738,7 @@ bool bloom_eval(
         inpL = ggml_mul(ctx0,
                     ggml_repeat(ctx0, model.output_norm, inpL),
                     inpL);
-        
+
         inpL = ggml_add(ctx0, ggml_repeat(ctx0, model.output_norm_b, inpL), inpL);
     }
 
@@ -880,7 +880,7 @@ int main(int argc, char ** argv) {
             {
                 const int64_t t_start_sample_us = ggml_time_us();
 
-                id = bloom_sample_top_p(vocab, logits.data() + (logits.size() - n_vocab), last_n_tokens, repeat_penalty, top_p, temp, rng);
+                id = bloom_sample_top_p(vocab, logits.data() + (logits.size() - n_vocab), last_n_tokens, repeat_penalty, top_p, params.top_k, temp, rng);
 
                 // // print
                 // printf("\ngenerated token: '%s' (%d)\n", vocab.id_to_token[id].c_str(), id);
@@ -927,7 +927,7 @@ int main(int argc, char ** argv) {
         printf("%s: mem per token = %8zu bytes\n", __func__, mem_per_token);
         printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
         printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
-        printf("%s:  predict time = %8.2f ms / %.2f ms per token\n", __func__, t_predict_us/1000.0f, t_predict_us/1000.0f/n_past);
+        printf("%s:  predict time = %8.2f ms / %d total tokens / %.2f ms per token\n", __func__, t_predict_us/1000.0f, n_past, t_predict_us/1000.0f/n_past);
         printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
     }
 

@@ -387,6 +387,7 @@ gpt_vocab::id bloom_sample_top_p(
         std::vector<gpt_vocab::id> & last_n_tokens,
         double repeat_penalty,
         double top_p,
+        int top_k,
         double temp,
         std::mt19937 & rng) {
     int n_logits = vocab.id_to_token.size();
@@ -420,19 +421,29 @@ gpt_vocab::id bloom_sample_top_p(
                     logits_id.push_back(std::make_pair(logits[i]*scale*repeat_penalty, i));
                 } else {
                     logits_id.push_back(std::make_pair(logits[i]*scale/repeat_penalty, i));
-                }                
+                }
             } else {
                 logits_id.push_back(std::make_pair(logits[i]*scale, i));
             }
         }
     }
 
-    std::sort(
-            logits_id.begin(),
-            logits_id.end(),
-            [](const std::pair<double, gpt_vocab::id> & a, const std::pair<double, gpt_vocab::id> & b) {
-        return a.first > b.first;
-    });
+    // here llama.cpp uses `std::partial_sort` to pick up the top k tokens,
+    // while bloomz.cpp uses `std::sort`, which causes poor performance.
+    // std::sort(
+    //         logits_id.begin(),
+    //         logits_id.end(),
+    //         [](const std::pair<double, gpt_vocab::id> & a, const std::pair<double, gpt_vocab::id> & b) {
+    //     return a.first > b.first;
+    // });
+    top_k = top_k > 0 ? std::min(top_k, n_logits) : n_logits;
+    std::partial_sort(
+        logits_id.begin(), logits_id.begin() + top_k, logits_id.end(),
+        [](const std::pair<double, gpt_vocab::id> & a, const std::pair<double, gpt_vocab::id> & b) {
+            return a.first > b.first;
+        }
+    );
+    logits_id.resize(top_k);
 
     double maxl = -INFINITY;
     for (const auto & kv : logits_id) {
@@ -486,8 +497,8 @@ gpt_vocab::id bloom_sample_top_p(
 }
 
 
-size_t ggml_quantize_q4_0(float * src, void * dst, int n, int k, int qk, int64_t * hist) {
-    const int nb = k / qk;
+size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk, int64_t * hist) {
+    const int64_t nb = k / qk;
     const size_t bs = (sizeof(float) + sizeof(uint8_t)*qk/2);
     const size_t row_size = nb*bs;
 
@@ -498,11 +509,11 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int n, int k, int qk, int64_t
 
     char * pdst = (char *) dst;
 
-    for (int j = 0; j < n; j += k) {
+    for (int64_t j = 0; j < n; j += k) {
         uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
         uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + sizeof(float));
 
-        for (int i = 0; i < nb; i++) {
+        for (int64_t i = 0; i < nb; i++) {
             float amax = 0.0f; // absolute max
 
             {

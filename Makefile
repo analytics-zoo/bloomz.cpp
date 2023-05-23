@@ -30,8 +30,8 @@ endif
 # Compile flags
 #
 
-CFLAGS   = -I.              -O3 -DNDEBUG -std=c11   -fPIC
-CXXFLAGS = -I. -I./examples -O3 -DNDEBUG -std=c++11 -fPIC
+CFLAGS   = -I.              -O3 -DNDEBUG -std=c11   -fPIC -march=native -mtune=native
+CXXFLAGS = -I. -I./examples -O3 -DNDEBUG -std=c++11 -fPIC -march=native -mtune=native
 LDFLAGS  =
 
 # OS specific
@@ -180,7 +180,7 @@ $(info I CC:       $(CCV))
 $(info I CXX:      $(CXXV))
 $(info )
 
-default: main quantize
+default: main quantize libbloom.so
 
 #
 # Build library
@@ -192,12 +192,14 @@ ggml.o: ggml.c ggml.h
 utils.o: utils.cpp utils.h
 	$(CXX) $(CXXFLAGS) -c utils.cpp -o utils.o
 
+libbloom.so: bloom.cpp ggml.o utils.o
+	$(CXX) $(CXXFLAGS) -shared -fPIC bloom.cpp ggml.o utils.o -o libbloom.so $(LDFLAGS)
+
 clean:
-	rm -f *.o main quantize
+	rm -f *.o *.so main quantize
 
 main: main.cpp ggml.o utils.o
 	$(CXX) $(CXXFLAGS) main.cpp ggml.o utils.o -o main $(LDFLAGS)
-	./main -h
 
 quantize: quantize.cpp ggml.o utils.o
 	$(CXX) $(CXXFLAGS) quantize.cpp ggml.o utils.o -o quantize $(LDFLAGS)

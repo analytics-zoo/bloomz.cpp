@@ -213,7 +213,7 @@ extern "C" {
 // we use the built-in 16-bit float type
     typedef __fp16 ggml_fp16_t;
 #else
-typedef uint16_t ggml_fp16_t;
+    typedef uint16_t ggml_fp16_t;
 #endif
 
 // convert FP16 <-> FP32
