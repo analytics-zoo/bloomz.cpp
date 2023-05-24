@@ -150,6 +150,19 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
             //    printf("%s: vocab[%d] = '%s'\n", __func__, i, word.c_str());
             //}
         }
+
+        for (auto const & kv : vocab.id_to_token) {
+            const std::string & word = kv.second;
+            if (word.size() > 0) {
+                if (word[0] == ' ') {
+                    if (word.size() > 1) {
+                        vocab.space_words[(uint8_t)word[1]].push_back(word);
+                    }
+                } else {
+                    vocab.words[(uint8_t)word[0]].push_back(word);
+                }
+            }
+        }
     }
 
     // for the big tensors, we have the option to store the data in 16-bit floats or quantized
@@ -804,7 +817,7 @@ int main(int argc, char ** argv) {
 
     int64_t t_load_us = 0;
 
-    gpt_vocab vocab;
+    gpt_vocab vocab{};
     bloom_model model;
 
     // load the model

@@ -259,24 +259,40 @@ std::vector<gpt_vocab::id> bloom_tokenize(const gpt_vocab & vocab, const std::st
 
      //find the longest token that matches the text
     int pos = 0;
+    gpt_vocab::id space_id = vocab.token_to_id.find(std::string(" "))->second;
     while (true) {
         int l = 0;
         int t = 0;
-        for (const auto & kv : vocab.id_to_token) {
-            if (kv.second.size() < l) continue;
-            if (kv.second.size() > text.size() - pos) continue;
-            if (text.substr(pos, kv.second.size()) == kv.second) {
-                l = kv.second.size();
-                t = kv.first;
+        if (text[pos] == ' ' && pos == text.size() - 1) {
+            t = space_id;
+            l = 1;
+        } else {
+            const std::vector<gpt_vocab::token> * words = nullptr;
+            if (text[pos] == ' ') {
+                words = &(vocab.space_words[(uint8_t)text[pos+1]]);
+            } else {
+                words = &(vocab.words[(uint8_t)text[pos]]);
             }
-        }
-
-        if (l == 0) {
-            break;
+            for (const auto & word : *words) {
+                if (word.size() < l) continue;
+                if (word.size() > text.size() - pos) continue;
+                if (text.substr(pos, word.size()) == word) {
+                    l = word.size();
+                    t = vocab.token_to_id.find(word)->second;
+                }
+            }
+            if (text[pos] == ' ' && l == 0) {
+                t = space_id;
+                l = 1;
+            }
         }
 
         res.push_back(t);
         pos += l;
+
+        if (l == 0 || pos >= text.size()) {
+            break;
+        }
     }
 
     return res;
