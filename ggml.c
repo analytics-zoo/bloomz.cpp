@@ -475,7 +475,7 @@ static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE / sizeof(float);
 // quantization
 //
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 // Load 256 bits and transform each abcd_efgh to 0000_abcd_0000_efgh
 static inline __m512i dequantize_64x4_2_64x8(const uint8_t* rsi) {
     // Load 32 bytes from memory
@@ -814,7 +814,7 @@ int32x4_t vcvtnq_s32_f32(float32x4_t v) {
 #endif
 
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 #define QK4_0 64
 #else
 #define QK4_0 32
@@ -825,7 +825,7 @@ typedef struct {
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(float) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 #define QK4_1 64
 #else
 #define QK4_1 32
@@ -863,7 +863,7 @@ typedef struct {
 static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK5_1 / 2,
               "wrong q5_1 block size/padding");
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 #define QK8_0 64
 #else
 #define QK8_0 32
@@ -895,7 +895,7 @@ void print_m256i(__m256i a) {
     printf("\n");
 }
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 void print_m512i(__m512i a) {
     print_m256i(_mm512_extracti32x8_epi32(a, 1));
     print_m256i(_mm512_castsi512_si256(a));
@@ -924,7 +924,7 @@ void print_m256f(__m256i a) {
     printf("\n");
 }
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
 void print_m512f(__m512i a) {
     print_m256f(_mm512_extracti32x8_epi32(a, 1));
     print_m256f(_mm512_castsi512_si256(a));
@@ -1655,7 +1655,7 @@ static void quantize_row_q8_0(const float *restrict x, void *restrict vy, int k)
             y[i].qs[4*l + 3] = vgetq_lane_s32(vi, 3);
         }
     }
-#elif defined(__AVX512F__) && defined(__AVX512VNNI__)
+#elif defined(__AVX512F__)
     for (int i = 0; i < nb; i++) {
         // Load elements into 4 AVX vectors
         __m512 v0 = _mm512_loadu_ps( x );
@@ -2002,7 +2002,7 @@ static void dequantize_row_q4_0(const void *restrict vx, float *restrict y, int 
 
     const block_q4_0 *restrict x = vx;
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
     for (int i = 0; i < nb; i++) {
         const __m512 d_v = _mm512_set1_ps(x[i].d);
         // Load 64x4-bit integers into 64x8-bit integers
@@ -2158,7 +2158,7 @@ static void dequantize_row_q4_1(const void *restrict vx, float *restrict y, int 
 
     const block_q4_1 *restrict x = vx;
 
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__)
     for (int i = 0; i < nb; i++) {
         const __m512 d_v = _mm512_set1_ps(x[i].d);
         const __m512 m_v = _mm512_set1_ps(x[i].m);
@@ -3175,13 +3175,15 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float *restrict s, const void *r
     }
 
     *s = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
-#elif defined(__AVX512F__) && defined(__AVX512VNNI__)
+#elif defined(__AVX512F__)
     // Initialize accumulator with zeros
     __m512 acc = _mm512_setzero_ps();
 
     const __m512i off = _mm512_set1_epi8(8);
     const __m512i zeros = _mm512_setzero_epi32();
-
+#ifndef __AVX512VNNI__
+    const __m512i ones = _mm512_set1_epi16(1);
+#endif
     // Main loop
     for (int i = 0; i < nb; ++i) {
         // /* Compute combined scale for the block */
@@ -3191,9 +3193,20 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float *restrict s, const void *r
         const __m512i by = _mm512_loadu_si512((const __m512i *)y[i].qs);
 
         // xy_q[0] :i32 = sum( (bx[i] - 8) * by[i] ) i :0->3
+#ifdef __AVX512VNNI__
         const __m512i q_off = _mm512_dpbusd_epi32(zeros, off, by);
         __m512i xy_q = _mm512_dpbusd_epi32(zeros, bx, by);
         xy_q = _mm512_sub_epi32(xy_q, q_off);
+#else
+        const __m512i bx_off = _mm512_sub_epi8( bx, off );
+        const __m512i ax = _mm512_abs_epi8(bx_off);
+
+        const __mmask64 lt_zero_mask =  _mm512_cmp_epi8_mask(bx, off, _MM_CMPINT_LT);
+        const __m512i sy = _mm512_mask_sub_epi8(by, lt_zero_mask, zeros, by);
+
+        const __m512i dot = _mm512_maddubs_epi16(ax, sy);
+        const __m512i xy_q = _mm512_madd_epi16(ones, dot);
+#endif
 
         /* Convert to vectore of 8 int32_t to 8 floats */
         const __m512 q = _mm512_cvtepi32_ps( xy_q );
