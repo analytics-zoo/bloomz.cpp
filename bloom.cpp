@@ -1003,12 +1003,13 @@ int chat(gpt_params & params,
             printf("Failed to predict\n");
             return 1;
         }
-        n_past += n;
 
         for (int i = 0; i < n; ++i) {
             last_n_tokens.erase(last_n_tokens.begin());
-            last_n_tokens.push_back(embd_inp[n_past + i]);
+            last_n_tokens.push_back(embd_inp[n_past - n_past_init + i]);
         }
+
+        n_past += n;
 
         t_eval_us += ggml_time_us() - t_start_eval_us;
     }

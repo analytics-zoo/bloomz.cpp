@@ -428,10 +428,12 @@ gpt_vocab::id bloom_sample_top_p(
 
     {
         const double scale = 1.0/temp;
+        std::vector<gpt_vocab::id> counter(n_logits, 0);
+        for (auto const & id : last_n_tokens) { counter[id] = 1; }
         for (int i = 0; i < n_logits; ++i) {
             // repetition penalty from CTRL paper (https://arxiv.org/abs/1909.05858)
             // credit https://github.com/facebookresearch/bloom/compare/main...shawwn:bloom:main
-            if (std::find(last_n_tokens.begin(), last_n_tokens.end(), i) != last_n_tokens.end()) {
+            if (counter[i] > 0) {
                 // if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
                 if (logits[i] < 0.0) {
                     logits_id.push_back(std::make_pair(logits[i]*scale*repeat_penalty, i));
@@ -460,6 +462,13 @@ gpt_vocab::id bloom_sample_top_p(
         }
     );
     logits_id.resize(top_k);
+    // std::pair<double, gpt_vocab::id> maxe = *std::max_element(logits_id.begin(), logits_id.end(),
+    //         [](const std::pair<double, gpt_vocab::id> & a, const std::pair<double, gpt_vocab::id> & b) {
+    //             return a.first > b.first;
+    //         });
+    // logits_id.clear();
+    // logits_id.push_back(maxe);
+
 
     double maxl = -INFINITY;
     for (const auto & kv : logits_id) {
