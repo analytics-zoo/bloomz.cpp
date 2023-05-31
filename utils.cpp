@@ -260,7 +260,7 @@ std::vector<gpt_vocab::id> bloom_tokenize(const gpt_vocab & vocab, const std::st
      //find the longest token that matches the text
     int pos = 0;
     gpt_vocab::id space_id = vocab.token_to_id.find(std::string(" "))->second;
-    while (true) {
+    while (pos < text.size()) {
         int l = 0;
         int t = 0;
         if (text[pos] == ' ' && pos == text.size() - 1) {
@@ -290,7 +290,7 @@ std::vector<gpt_vocab::id> bloom_tokenize(const gpt_vocab & vocab, const std::st
         res.push_back(t);
         pos += l;
 
-        if (l == 0 || pos >= text.size()) {
+        if (l == 0) {
             break;
         }
     }

@@ -77,9 +77,7 @@ struct ChatContext {
     bloom_model model;
     gpt_vocab vocab;
     size_t mem_per_token = 0;
-    size_t n_chars = 0;
-    size_t n_past = 0;
-    std::vector<gpt_vocab::id> last_n_tokens;
+    std::vector<gpt_vocab::id> cached_tokens;
 };
 
 // load the model's weights from a file
@@ -814,11 +812,6 @@ extern "C" ChatContext* bloom_load(const char * fname, int n_ctx, int n_threads)
         return 0;
     }
 
-    // init last_n_tokens
-    gpt_params params;
-    ctx->last_n_tokens.resize(params.repeat_last_n);
-    std::fill(ctx->last_n_tokens.begin(), ctx->last_n_tokens.end(), 0);
-
     return ctx;
 }
 
@@ -830,142 +823,13 @@ int inference(gpt_params & params,
               const bloom_model & model,
               const gpt_vocab & vocab,
               size_t mem_per_token,
+              std::vector<gpt_vocab::id>& tokens,
+              std::vector<gpt_vocab::id>& last_n_tokens,
+              int n_past,
               char * dst) {
     ggml_time_init();
-    const int64_t t_main_start_us = ggml_time_us();
+    const int64_t t_start_us = ggml_time_us();
 
-    printf("%s: seed = %d\n", __func__, params.seed);
-
-    std::mt19937 rng(params.seed);
-
-    int64_t t_load_us = 0;
-
-    int n_past = 0;
-
-    int64_t t_sample_us  = 0;
-    int64_t t_predict_us = 0;
-
-    std::vector<float> logits;
-
-    // tokenize the prompt
-    std::vector<gpt_vocab::id> embd_inp = ::bloom_tokenize(vocab, params.prompt, false); //TODO: set bos to true?
-
-    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
-
-    printf("\n");
-    printf("%s: prompt: '%s'\n", __func__, params.prompt.c_str());
-    printf("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
-    for (int i = 0; i < (int) embd_inp.size(); i++) {
-        printf("%6d -> '%s'\n", embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
-    }
-    printf("\n");
-    printf("sampling parameters: temp = %f, top_k = %d, top_p = %f, repeat_last_n = %i, repeat_penalty = %f\n", params.temp, params.top_k, params.top_p, params.repeat_last_n, params.repeat_penalty);
-    printf("\n\n");
-
-    std::vector<gpt_vocab::id> embd;
-
-    int last_n_size = params.repeat_last_n;
-    std::vector<gpt_vocab::id> last_n_tokens(last_n_size);
-    std::fill(last_n_tokens.begin(), last_n_tokens.end(), 0);
-
-    for (int i = embd.size(); i < embd_inp.size() + params.n_predict; i++) {
-        // predict
-        if (embd.size() > 0) {
-            const int64_t t_start_us = ggml_time_us();
-
-            if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) { // update logits
-                printf("Failed to predict\n");
-                return 1;
-            }
-
-            t_predict_us += ggml_time_us() - t_start_us;
-        }
-
-        n_past += embd.size();
-        embd.clear();
-
-        if (i >= embd_inp.size()) {
-            // sample next token
-            const float top_p = params.top_p;
-            const float temp  = params.temp;
-            const float repeat_penalty = params.repeat_penalty;
-
-            const int n_vocab = model.hparams.n_vocab;
-
-            gpt_vocab::id id = 0;
-
-            {
-                const int64_t t_start_sample_us = ggml_time_us();
-
-                id = bloom_sample_top_p(vocab, logits.data() + (logits.size() - n_vocab), last_n_tokens, repeat_penalty, top_p, params.top_k, temp, rng);
-
-                // // print
-                // printf("\ngenerated token: '%s' (%d)\n", vocab.id_to_token[id].c_str(), id);
-
-                last_n_tokens.erase(last_n_tokens.begin());
-                last_n_tokens.push_back(id);
-
-                t_sample_us += ggml_time_us() - t_start_sample_us;
-            }
-
-            // add it to the context
-            embd.push_back(id);
-        } else {
-            // if here, it means we are still processing the input prompt
-            for (int k = i; k < embd_inp.size(); k++) {
-                embd.push_back(embd_inp[k]);
-                last_n_tokens.erase(last_n_tokens.begin());
-                last_n_tokens.push_back(embd_inp[k]);
-                if (embd.size() > params.n_batch) {
-                    break;
-                }
-            }
-            i += embd.size() - 1;
-        }
-
-        // display text
-        for (auto id : embd) {
-            const auto& word = vocab.id_to_token.find(id)->second;
-            printf("%s", word.c_str());
-            strcpy(dst, word.c_str());
-            dst += strlen(word.c_str());
-        }
-        fflush(stdout);
-
-        // end of text token
-        if (embd.back() == 2) {
-            printf(" [end of text]\n");
-            break;
-        }
-    }
-
-    // report timing
-    {
-        const int64_t t_main_end_us = ggml_time_us();
-
-        printf("\n\n");
-        printf("%s: mem per token = %8zu bytes\n", __func__, mem_per_token);
-        printf("%s:     load time = %8.2f ms\n", __func__, t_load_us/1000.0f);
-        printf("%s:   sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
-        printf("%s:  predict time = %8.2f ms / %d total tokens / %.2f ms per token\n", __func__, t_predict_us/1000.0f, n_past, t_predict_us/1000.0f/n_past);
-        printf("%s:    total time = %8.2f ms\n", __func__, (t_main_end_us - t_main_start_us)/1000.0f);
-    }
-
-    return 0;
-}
-
-int chat(gpt_params & params,
-         const bloom_model & model,
-         const gpt_vocab & vocab,
-         size_t mem_per_token,
-         size_t & n_chars,
-         size_t & n_past,
-         std::vector<gpt_vocab::id>& last_n_tokens,
-         char * dst) {
-    ggml_time_init();
-    const int64_t chat_start_us = ggml_time_us();
-
-    int64_t t_tokenize_us = 0;
     int64_t t_sample_us  = 0;
     int64_t t_eval_us = 0;
     int64_t t_predict_us = 0;
@@ -973,49 +837,25 @@ int chat(gpt_params & params,
 
     std::mt19937 rng(params.seed);
     std::vector<float> logits;
-    std::vector<gpt_vocab::id> embd_inp;
 
-    {
-        // tokenize the prompt
-        const int64_t t_start_tokenize = ggml_time_us();
-        if (params.prompt.size() > 0) {
-            embd_inp = ::bloom_tokenize(vocab, params.prompt, false); //TODO: set bos to true?
-        }
-        if (last_n_tokens.back() > 0) {
-            embd_inp.insert(embd_inp.begin(), last_n_tokens.back());
-        }
-
-        t_tokenize_us += ggml_time_us() - t_start_tokenize;
-    }
-
-    size_t n_input = n_past_init + embd_inp.size();
-    params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int)n_input);
-
-    while (n_past < n_input) {
+    while (n_past < tokens.size()) {
         // eval input prompt
         const int64_t t_start_eval_us = ggml_time_us();
 
-        int n = std::min((size_t)params.n_batch, n_input - n_past);
-        std::vector<gpt_vocab::id> embd(embd_inp.cbegin() + (n_past - n_past_init),
-                                        embd_inp.cbegin() + (n_past - n_past_init) + n);
+        int n = std::min((size_t)params.n_batch, tokens.size() - n_past);
+        std::vector<gpt_vocab::id> embd(tokens.cbegin() + n_past,
+                                        tokens.cbegin() + n_past + n);
         if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
             // todo: better error handling
             printf("Failed to predict\n");
             return 1;
         }
-
-        for (int i = 0; i < n; ++i) {
-            last_n_tokens.erase(last_n_tokens.begin());
-            last_n_tokens.push_back(embd_inp[n_past - n_past_init + i]);
-        }
-
         n_past += n;
 
         t_eval_us += ggml_time_us() - t_start_eval_us;
     }
 
-    n_chars += params.prompt.size();
-
+    int n_predict = 0;
     while (1) {
         {
             // sample next token
@@ -1031,15 +871,16 @@ int chat(gpt_params & params,
                                                   rng);
             last_n_tokens.erase(last_n_tokens.begin());
             last_n_tokens.push_back(id);
+            tokens.push_back(id);
+            ++n_predict;
 
             const auto& word = vocab.id_to_token.find(id)->second;
             strcpy(dst, word.c_str());
             dst += word.size();
-            n_chars += word.size();
 
             t_sample_us += ggml_time_us() - t_start_sample_us;
         }
-        if (last_n_tokens.back() == 2 || n_past >= n_input + params.n_predict - 1) {
+        if (last_n_tokens.back() == 2 || n_predict >= params.n_predict) {
             // end of text token or reach the token number limit
             break;
         }
@@ -1048,7 +889,7 @@ int chat(gpt_params & params,
             // predict the next token
             const int64_t t_start_predict_us = ggml_time_us();
 
-            std::vector<gpt_vocab::id> embd(1, last_n_tokens.back());
+            std::vector<gpt_vocab::id> embd(1, tokens.back());
             if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
                 // todo: better error handling
                 printf("Failed to predict\n");
@@ -1062,25 +903,23 @@ int chat(gpt_params & params,
 
     // report timing
     {
-        const int64_t chat_end_us = ggml_time_us();
+        const int64_t t_end_us = ggml_time_us();
 
-        int n_prompt = embd_inp.size();
-        int n_predict = n_past - n_input;
+        int n_prompt = tokens.size() - n_predict - n_past_init;
+        n_predict = n_predict - 1;
 
         printf("\n\n");
-        printf("input prompt: \"%s\"\n", params.prompt.c_str());
         printf("%s:    mem per token = %8zu bytes\n", __func__, mem_per_token);
-        printf("%s:    tokenize time = %8.2f ms\n", __func__, t_tokenize_us/1000.0f);
         printf("%s:      sample time = %8.2f ms\n", __func__, t_sample_us/1000.0f);
         printf("%s: evel prompt time = %8.2f ms / %d tokens / %.2f ms per token\n", __func__, t_eval_us/1000.0f, n_prompt, t_eval_us/1000.0f/n_prompt);
         printf("%s:     predict time = %8.2f ms / %d tokens / %.2f ms per token\n", __func__, t_predict_us/1000.0f, n_predict, t_predict_us/1000.0f/n_predict);
-        printf("%s:       total time = %8.2f ms\n", __func__, (chat_end_us - chat_start_us)/1000.0f);
+        printf("%s:       total time = %8.2f ms\n", __func__, (t_end_us - t_start_us)/1000.0f);
     }
 
-    return n_chars;
+    return 0;
 }
 
-extern "C" int bloom_run(ChatContext* ctx,
+extern "C" int bloom_run(ChatContext *ctx,
                          int32_t seed,
                          int32_t n_threads,
                          int32_t n_batch,
@@ -1089,41 +928,62 @@ extern "C" int bloom_run(ChatContext* ctx,
                          char* dst)
 {
     gpt_params params;
-    params.seed = params.seed < 0 ? time(NULL) : seed;
+    params.seed = seed < 0 ? time(NULL) : seed;
     params.n_threads = n_threads > 0 ? n_threads : params.n_threads;
-    params.n_predict = n_predict;
-    params.n_batch = n_batch;
-    params.prompt = prompt;
+    params.n_batch = n_batch > 0 ? n_batch : params.n_batch;
 
-    return inference(params, ctx->model, ctx->vocab, ctx->mem_per_token, dst);
-}
+    std::vector<gpt_vocab::id> & cached_tokens = ctx->cached_tokens;
 
-extern "C" int bloom_chat(ChatContext *ctx,
-                          int32_t seed,
-                          int32_t n_threads,
-                          int32_t n_batch,
-                          int32_t n_predict,
-                          const char* prompt,
-                          char* dst)
-{
-    gpt_params params;
-    params.seed = params.seed < 0 ? time(NULL) : seed;
-    params.n_threads = n_threads > 0 ? n_threads : params.n_threads;
-    params.n_predict = n_predict;
-    params.n_batch = n_batch;
-    params.prompt = std::string(prompt + ctx->n_chars);
+    int n_past = 0, n_chars = 0, match = true;
+    for (int id : cached_tokens) {
+        const std::string & str = ctx->vocab.id_to_token[id];
+        for (int j = 0; j < str.size(); ++j) {
+            if (prompt[n_chars + j] == '\0' || prompt[n_chars + j] != str[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            n_past += 1;
+            n_chars += str.size();
+        } else {
+            break;
+        }
+    }
+    n_past = std::max(n_past - 1, 0);
+
+    params.prompt = std::string(prompt + n_chars);
+    std::vector<gpt_vocab::id> new_tokens = bloom_tokenize(ctx->vocab, params.prompt, false);
+    cached_tokens.insert(cached_tokens.end(), new_tokens.begin(), new_tokens.end());
+    params.n_predict = std::min(n_predict, ctx->model.hparams.n_ctx - (int)cached_tokens.size());
+
+    std::vector<gpt_vocab::id> last_n_tokens{};
+    if (n_past == 0) {
+        last_n_tokens.resize(params.repeat_last_n, 0);
+    } else {
+        if (n_past >= params.repeat_last_n) {
+            for (int i = n_past - params.repeat_last_n; i < n_past; ++i) {
+                last_n_tokens.push_back(cached_tokens[i]);
+            }
+        } else {
+            last_n_tokens.resize(params.repeat_last_n - n_past, 0);
+            for (int i = 0; i < n_past; ++i) {
+                last_n_tokens.push_back(cached_tokens[i]);
+            }
+        }
+    }
 
     strcpy(dst, prompt);
     dst += strlen(prompt);
 
-    int ret = chat(params,
-                   ctx->model,
-                   ctx->vocab,
-                   ctx->mem_per_token,
-                   ctx->n_chars,
-                   ctx->n_past,
-                   ctx->last_n_tokens,
-                   dst);
+    int ret = inference(params,
+                        ctx->model,
+                        ctx->vocab,
+                        ctx->mem_per_token,
+                        cached_tokens,
+                        last_n_tokens,
+                        n_past,
+                        dst);
     if (ret < 0) {
         dst[0] = '\0';
         return -1;
