@@ -950,6 +950,7 @@ extern "C" int bloom_run(ChatContext *ctx,
             break;
         }
     }
+    cached_tokens.resize(n_past);
     n_past = std::max(n_past - 1, 0);
 
     params.prompt = std::string(prompt + n_chars);
