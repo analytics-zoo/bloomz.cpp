@@ -871,7 +871,6 @@ int inference(gpt_params & params,
                                                   rng);
             last_n_tokens.erase(last_n_tokens.begin());
             last_n_tokens.push_back(id);
-            tokens.push_back(id);
             ++n_predict;
 
             const auto& word = vocab.id_to_token.find(id)->second;
@@ -889,12 +888,13 @@ int inference(gpt_params & params,
             // predict the next token
             const int64_t t_start_predict_us = ggml_time_us();
 
-            std::vector<gpt_vocab::id> embd(1, tokens.back());
+            std::vector<gpt_vocab::id> embd(1, last_n_tokens.back());
             if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
                 // todo: better error handling
                 printf("Failed to predict\n");
                 return -1;
             }
+            tokens.push_back(last_n_tokens.back());
             ++n_past;
 
             t_predict_us += ggml_time_us() - t_start_predict_us;
@@ -924,6 +924,7 @@ extern "C" int bloom_run(ChatContext *ctx,
                          int32_t n_threads,
                          int32_t n_batch,
                          int32_t n_predict,
+                         bool match_str,
                          const char* prompt,
                          char* dst)
 {
@@ -934,43 +935,58 @@ extern "C" int bloom_run(ChatContext *ctx,
 
     std::vector<gpt_vocab::id> & cached_tokens = ctx->cached_tokens;
 
-    int n_past = 0, n_chars = 0, match = true;
-    for (int id : cached_tokens) {
-        const std::string & str = ctx->vocab.id_to_token[id];
-        for (int j = 0; j < str.size(); ++j) {
-            if (prompt[n_chars + j] == '\0' || prompt[n_chars + j] != str[j]) {
-                match = false;
+    int n_past = 0;
+    if (match_str) {
+        int n_chars = 0, match = true;
+        for (int id : cached_tokens) {
+            const std::string & str = ctx->vocab.id_to_token[id];
+            for (int j = 0; j < str.size(); ++j) {
+                if (prompt[n_chars + j] == '\0' || prompt[n_chars + j] != str[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                n_past += 1;
+                n_chars += str.size();
+            } else {
                 break;
             }
         }
-        if (match) {
-            n_past += 1;
-            n_chars += str.size();
-        } else {
-            break;
-        }
-    }
-    cached_tokens.resize(n_past);
-    n_past = std::max(n_past - 1, 0);
+        cached_tokens.resize(n_past);
 
-    params.prompt = std::string(prompt + n_chars);
-    std::vector<gpt_vocab::id> new_tokens = bloom_tokenize(ctx->vocab, params.prompt, false);
-    cached_tokens.insert(cached_tokens.end(), new_tokens.begin(), new_tokens.end());
+        params.prompt = std::string(prompt + n_chars);
+        printf("n_past: %d, n_chars: %d, prompt: %s\n", n_past, n_chars, params.prompt.c_str());
+        std::vector<gpt_vocab::id> new_tokens = bloom_tokenize(ctx->vocab, params.prompt, false);
+        cached_tokens.insert(cached_tokens.end(), new_tokens.begin(), new_tokens.end());
+    } else {
+        params.prompt = std::string(prompt);
+        std::vector<gpt_vocab::id> input_tokens = bloom_tokenize(ctx->vocab, params.prompt, false);
+
+        while (n_past < cached_tokens.size() && n_past < input_tokens.size()) {
+            if (cached_tokens[n_past] == input_tokens[n_past]) {
+                ++n_past;
+            } else {
+                break;
+            }
+        }
+        printf("n_past: %d\n", n_past);
+
+        cached_tokens.swap(input_tokens);
+    }
+
     params.n_predict = std::min(n_predict, ctx->model.hparams.n_ctx - (int)cached_tokens.size());
 
     std::vector<gpt_vocab::id> last_n_tokens{};
-    if (n_past == 0) {
-        last_n_tokens.resize(params.repeat_last_n, 0);
+    int n_tokens = cached_tokens.size();
+    if (n_tokens >= params.repeat_last_n) {
+        for (int i = n_tokens - params.repeat_last_n; i < n_tokens; ++i) {
+            last_n_tokens.push_back(cached_tokens[i]);
+        }
     } else {
-        if (n_past >= params.repeat_last_n) {
-            for (int i = n_past - params.repeat_last_n; i < n_past; ++i) {
-                last_n_tokens.push_back(cached_tokens[i]);
-            }
-        } else {
-            last_n_tokens.resize(params.repeat_last_n - n_past, 0);
-            for (int i = 0; i < n_past; ++i) {
-                last_n_tokens.push_back(cached_tokens[i]);
-            }
+        last_n_tokens.resize(params.repeat_last_n - n_tokens, 0);
+        for (int i = 0; i < n_tokens; ++i) {
+            last_n_tokens.push_back(cached_tokens[i]);
         }
     }
 
