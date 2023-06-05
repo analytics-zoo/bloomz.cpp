@@ -11,19 +11,9 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(LLAMA_STANDALONE ON)
-
-    # configure project version
-    # TODO
-else()
-    set(LLAMA_STANDALONE OFF)
-endif()
 
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
-
-    option(LLAMA_WASM_SINGLE_FILE "llama: embed WASM inside the generated llama.js" ON)
 else()
     if (MINGW)
         set(BUILD_SHARED_LIBS_DEFAULT OFF)
@@ -80,7 +70,7 @@ add_library(ggml OBJECT
 
 target_include_directories(ggml PUBLIC .)
 target_compile_features(ggml PUBLIC c_std_11) # don't bump
-# target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
+target_link_libraries(ggml PUBLIC Threads::Threads)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -92,7 +82,7 @@ add_library(bloom
 
 target_include_directories(bloom PUBLIC .)
 target_compile_features(bloom PUBLIC cxx_std_11) # don't bump
-target_link_libraries(bloom PRIVATE ggml ${LLAMA_EXTRA_LIBS})
+target_link_libraries(bloom PRIVATE ggml)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(bloom PROPERTIES POSITION_INDEPENDENT_CODE ON)
