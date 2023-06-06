@@ -566,7 +566,7 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk,
                 hist[vi0]++;
                 hist[vi1]++;
 
-                pp[l/2] = vi0 | (vi1 << 4);
+                pp[l] = vi0 | (vi1 << 4);
             }
 
             memcpy(pb, pp, pp_size);
