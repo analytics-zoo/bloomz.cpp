@@ -540,38 +540,37 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk,
 
         for (int64_t i = 0; i < nb; i++) {
             float amax = 0.0f; // absolute max
+            float max  = 0.0f;
 
-            {
-                for (int l = 0; l < qk; l++) {
-                    const float v = src[j + i*qk + l];
-                    amax = std::max(amax, fabsf(v));
+            for (int l = 0; l < qk; l++) {
+                const float v = src[j + i*qk + l];
+                if (amax < fabsf(v)) {
+                    amax = fabsf(v);
+                    max = v;
                 }
-
-                const float d = amax / ((1 << 3) - 1);
-                const float id = d ? 1.0f/d : 0.0f;
-
-                *(float *) pd = d;
-                pd += bs;
-
-                for (int l = 0; l < qk; l += 2) {
-                    const float v0 = (src[j + i*qk + l + 0])*id;
-                    const float v1 = (src[j + i*qk + l + 1])*id;
-
-                    const uint8_t vi0 = ((int8_t) (round(v0))) + 8;
-                    const uint8_t vi1 = ((int8_t) (round(v1))) + 8;
-
-                    assert(vi0 >= 0 && vi0 < 16);
-                    assert(vi1 >= 0 && vi1 < 16);
-
-                    hist[vi0]++;
-                    hist[vi1]++;
-
-                    pp[l/2] = vi0 | (vi1 << 4);
-                }
-
-                memcpy(pb, pp, pp_size);
-                pb += bs;
             }
+
+            const float d = max / -8;
+            const float id = d ? 1.0f/d : 0.0f;
+
+            *(float *) pd = d;
+            pd += bs;
+
+            for (int l = 0; l < qk/2; ++l) {
+                const float x0 = src[j + i*qk + 0    + l]*id;
+                const float x1 = src[j + i*qk + qk/2 + l]*id;
+
+                const uint8_t vi0 = std::min((int8_t)15, (int8_t)(x0 + 8.5f));
+                const uint8_t vi1 = std::min((int8_t)15, (int8_t)(x1 + 8.5f));
+
+                hist[vi0]++;
+                hist[vi1]++;
+
+                pp[l/2] = vi0 | (vi1 << 4);
+            }
+
+            memcpy(pb, pp, pp_size);
+            pb += bs;
         }
     }
 
