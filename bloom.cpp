@@ -590,10 +590,13 @@ bool bloom_eval(
         }
     }
 
-    struct ggml_init_params params = {
-        .mem_size   = buf_size,
-        .mem_buffer = buf,
-    };
+    // struct ggml_init_params params = {
+    //     .mem_size   = buf_size,
+    //     .mem_buffer = buf,
+    // };
+    struct ggml_init_params params;
+    params.mem_size = buf_size;
+    params.mem_buffer = buf;
 
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_cgraph gf = {};
