@@ -27,6 +27,13 @@ endif()
 # Option list
 #
 
+# instruction set specific
+option(BLOOM_AVX                    "BLOOM: enable AVX"                                     ON)
+option(BLOOM_AVX2                   "BLOOM: enable AVX2"                                    ON)
+option(BLOOM_AVX512                 "BLOOM: enable AVX512"                                  OFF)
+option(BLOOM_AVX512_VBMI            "BLOOM: enable AVX512-VBMI"                             OFF)
+option(BLOOM_AVX512_VNNI            "BLOOM: enable AVX512-VNNI"                             OFF)
+option(BLOOM_FMA                    "BLOOM: enable FMA"                                     ON)
 
 #
 # Build info header
@@ -58,7 +65,85 @@ endif()
 # TODO: probably these flags need to be tweaked on some architectures
 #       feel free to update the Makefile for your architecture and send a pull request or issue
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
-
+if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "arm" OR ${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+    message(STATUS "ARM detected")
+    if (MSVC)
+        # TODO: arm msvc?
+    else()
+        if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
+            # Apple M1, M2, etc.
+            # Raspberry Pi 3, 4, Zero 2 (64-bit)
+            add_compile_options(-mcpu=native)
+        endif()
+        if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "armv6")
+            # Raspberry Pi 1, Zero
+            add_compile_options(-mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access)
+        endif()
+        if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "armv7")
+            # Raspberry Pi 2
+            add_compile_options(-mfpu=neon-fp-armv8 -mfp16-format=ieee -mno-unaligned-access -funsafe-math-optimizations)
+        endif()
+        if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "armv8")
+            # Raspberry Pi 3, 4, Zero 2 (32-bit)
+            add_compile_options(-mfp16-format=ieee -mno-unaligned-access)
+        endif()
+    endif()
+elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "^(x86_64|i686|AMD64)$")
+    message(STATUS "x86 detected")
+    if (MSVC)
+        if (BLOOM_AVX512)
+            add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX512>)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
+            # MSVC has no compile-time flags enabling specific
+            # AVX512 extensions, neither it defines the
+            # macros corresponding to the extensions.
+            # Do it manually.
+            if (BLOOM_AVX512_VBMI)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVX512VBMI__>)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVX512VBMI__>)
+            endif()
+            if (BLOOM_AVX512_VNNI)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:C>:__AVX512VNNI__>)
+                add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:__AVX512VNNI__>)
+            endif()
+        elseif (BLOOM_AVX2)
+            add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
+        elseif (BLOOM_AVX)
+            add_compile_options($<$<COMPILE_LANGUAGE:C>:/arch:AVX>)
+            add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX>)
+        endif()
+    else()
+        if (BLOOM_F16C)
+            add_compile_options(-mf16c)
+        endif()
+        if (BLOOM_FMA)
+            add_compile_options(-mfma)
+        endif()
+        if (BLOOM_AVX)
+            add_compile_options(-mavx)
+        endif()
+        if (BLOOM_AVX2)
+            add_compile_options(-mavx2)
+        endif()
+        if (BLOOM_AVX512)
+            add_compile_options(-mavx512f)
+            add_compile_options(-mavx512bw)
+        endif()
+        if (BLOOM_AVX512_VBMI)
+            add_compile_options(-mavx512vbmi)
+        endif()
+        if (BLOOM_AVX512_VNNI)
+            add_compile_options(-mavx512vnni)
+        endif()
+    endif()
+elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
+    message(STATUS "PowerPC detected")
+    add_compile_options(-mcpu=native -mtune=native)
+    #TODO: Add  targets for Power8/Power9 (Altivec/VSX) and Power10(MMA) and query for big endian systems (ppc64/le/be)
+else()
+    message(STATUS "Unknown architecture")
+endif()
 
 #
 # Build libraries
