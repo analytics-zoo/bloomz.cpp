@@ -1011,3 +1011,17 @@ extern "C" int bloom_run(ChatContext *ctx,
 
     return 0;
 }
+
+extern "C" void c_free(void * p) {
+    free(p);
+}
+
+extern "C" int32_t* tokenize_api(ChatContext *ctx,
+                                 const char *prompt,
+                                 bool bos) {
+    std::vector<gpt_vocab::id> tokens = bloom_tokenize(ctx->vocab, prompt, bos);
+    int32_t *c_tokens = (int32_t*)malloc(sizeof(int32_t) * (tokens.size() + 1));
+    c_tokens[0] = tokens.size();
+    std::copy(tokens.cbegin(), tokens.cend(), c_tokens + 1);
+    return c_tokens;
+}
