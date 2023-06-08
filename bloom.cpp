@@ -590,13 +590,11 @@ bool bloom_eval(
         }
     }
 
-    // struct ggml_init_params params = {
-    //     .mem_size   = buf_size,
-    //     .mem_buffer = buf,
-    // };
-    struct ggml_init_params params;
-    params.mem_size = buf_size;
-    params.mem_buffer = buf;
+    struct ggml_init_params params = {
+        buf_size,
+        buf,
+        false
+    };
 
     struct ggml_context * ctx0 = ggml_init(params);
     ggml_cgraph gf = {};
@@ -956,6 +954,7 @@ extern "C" int bloom_run(ChatContext *ctx,
                 break;
             }
         }
+        n_past = prompt[n_chars] == '\0' ? n_past-1 : n_past;
         cached_tokens.resize(n_past);
 
         params.prompt = std::string(prompt + n_chars);
@@ -973,6 +972,7 @@ extern "C" int bloom_run(ChatContext *ctx,
                 break;
             }
         }
+        n_past = std::min(n_past, (int)input_tokens.size() - 1);
         printf("n_past: %d\n", n_past);
 
         cached_tokens.swap(input_tokens);
@@ -1018,10 +1018,112 @@ extern "C" void c_free(void * p) {
 
 extern "C" int32_t* tokenize_api(ChatContext *ctx,
                                  const char *prompt,
-                                 bool bos) {
+                                 bool bos,
+                                 int32_t *len) {
     std::vector<gpt_vocab::id> tokens = bloom_tokenize(ctx->vocab, prompt, bos);
-    int32_t *c_tokens = (int32_t*)malloc(sizeof(int32_t) * (tokens.size() + 1));
-    c_tokens[0] = tokens.size();
-    std::copy(tokens.cbegin(), tokens.cend(), c_tokens + 1);
+    int32_t *c_tokens = (int32_t*)malloc(sizeof(int32_t) * tokens.size());
+    std::copy(tokens.cbegin(), tokens.cend(), c_tokens);
+    *len = tokens.size();
     return c_tokens;
+}
+
+extern "C" char* detokenize_api(ChatContext *ctx,
+                                int32_t token_id) {
+    const gpt_vocab::token& word = ctx->vocab.id_to_token[token_id];
+    char *dst = (char *)malloc(sizeof(char) * (word.size() + 1));
+    strcpy(dst, word.c_str());
+    return dst;
+}
+
+static std::vector<float> eval_internal(ChatContext *ctx,
+                                        int32_t *tokens,
+                                        int32_t token_num,
+                                        int32_t n_threads,
+                                        int32_t n_batch) {
+    gpt_params params;
+    params.n_threads = n_threads > 0 ? n_threads : params.n_threads;
+    params.n_batch = n_batch > 0 ? n_batch : params.n_batch;
+
+    int n_past = 0;
+    std::vector<gpt_vocab::id> & cached_tokens = ctx->cached_tokens;
+    std::vector<gpt_vocab::id> input_tokens(tokens, tokens + token_num);
+    while (n_past < cached_tokens.size() && n_past < token_num) {
+        if (cached_tokens[n_past] == input_tokens[n_past]) {
+            ++n_past;
+        } else {
+            break;
+        }
+    }
+    n_past = std::min(n_past, token_num - 1);
+
+    printf("n_past: %d\n", n_past);
+
+    std::vector<float> logits;
+    while (n_past < input_tokens.size()) {
+        // eval input prompt
+        int n = std::min((size_t)params.n_batch, input_tokens.size() - n_past);
+        std::vector<gpt_vocab::id> embd(input_tokens.cbegin() + n_past,
+                                        input_tokens.cbegin() + n_past + n);
+        if (!bloom_eval(ctx->model, params.n_threads, n_past, embd, logits, ctx->mem_per_token)) {
+            // todo: better error handling
+            printf("Failed to predict\n");
+            exit(1);
+        }
+        n_past += n;
+    }
+
+    cached_tokens.swap(input_tokens);
+    return logits;
+}
+
+extern "C" float* eval_api(ChatContext *ctx,
+                           int32_t *tokens,
+                           int32_t token_num,
+                           int32_t seed,
+                           int32_t n_threads,
+                           int32_t n_batch,
+                           int32_t* len) {
+    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch);
+    float *c_logits = (float *)malloc(sizeof(float) * logits.size());
+    std::copy(logits.cbegin(), logits.cend(), c_logits);
+    *len = logits.size();
+    return c_logits;
+}
+
+
+extern "C" int32_t forward_api(ChatContext *ctx,
+                               int32_t *tokens,
+                               int32_t token_num,
+                               int32_t seed,
+                               int32_t n_threads,
+                               int32_t n_batch) {
+    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch);
+
+    gpt_params params;
+    params.seed = seed < 0 ? time(NULL) : seed;
+
+    std::mt19937 rng(seed);
+    std::vector<gpt_vocab::id> & cached_tokens = ctx->cached_tokens;
+    std::vector<gpt_vocab::id> last_n_tokens{};
+    int n_tokens = cached_tokens.size();
+    if (n_tokens >= params.repeat_last_n) {
+        for (int i = n_tokens - params.repeat_last_n; i < n_tokens; ++i) {
+            last_n_tokens.push_back(cached_tokens[i]);
+        }
+    } else {
+        last_n_tokens.resize(params.repeat_last_n - n_tokens, 0);
+        for (int i = 0; i < n_tokens; ++i) {
+            last_n_tokens.push_back(cached_tokens[i]);
+        }
+    }
+
+    gpt_vocab::id id = bloom_sample_top_p(ctx->vocab,
+                                          logits.data() + (logits.size() - ctx->model.hparams.n_vocab),
+                                          last_n_tokens,
+                                          params.repeat_penalty,
+                                          params.top_p,
+                                          params.top_k,
+                                          params.temp,
+                                          rng);
+    return id;
 }
