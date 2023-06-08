@@ -560,9 +560,10 @@ bool bloom_eval(
         const int n_past,
         const std::vector<gpt_vocab::id> & embd_inp,
               std::vector<float>         & embd_w,
-              size_t                     & mem_per_token) {
+              size_t                     & mem_per_token,
+              bool logits_all = false) {
 
-    const int N = embd_inp.size();
+    const int64_t N = embd_inp.size();
 
     const auto & hparams = model.hparams;
 
@@ -574,7 +575,7 @@ bool bloom_eval(
 
     const int d_key = n_embd/n_head;
 
-    static size_t buf_size = 512ul*10000*10000;     // todo!
+    static size_t buf_size = 512ul*2048*2048;     // todo!
     static void * buf = malloc(buf_size);
 
     if (mem_per_token > 0 && mem_per_token*N > buf_size) {
@@ -784,8 +785,14 @@ bool bloom_eval(
     //memcpy(embd_w.data(), ggml_get_data(inpL), sizeof(float)*n_vocab*N);
 
     // return result for just the last token
-    embd_w.resize(n_vocab);
-    memcpy(embd_w.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
+    if (!logits_all) {
+        embd_w.resize(n_vocab);
+        memcpy(embd_w.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
+    } else {
+        embd_w.resize(n_vocab * N);
+        memcpy(embd_w.data(), (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+    }
+
 
     if (mem_per_token == 0) {
         mem_per_token = ggml_used_mem(ctx0)/N;
@@ -1039,7 +1046,8 @@ static std::vector<float> eval_internal(ChatContext *ctx,
                                         int32_t *tokens,
                                         int32_t token_num,
                                         int32_t n_threads,
-                                        int32_t n_batch) {
+                                        int32_t n_batch,
+                                        bool logits_all = false) {
     gpt_params params;
     params.n_threads = n_threads > 0 ? n_threads : params.n_threads;
     params.n_batch = n_batch > 0 ? n_batch : params.n_batch;
@@ -1064,7 +1072,7 @@ static std::vector<float> eval_internal(ChatContext *ctx,
         int n = std::min((size_t)params.n_batch, input_tokens.size() - n_past);
         std::vector<gpt_vocab::id> embd(input_tokens.cbegin() + n_past,
                                         input_tokens.cbegin() + n_past + n);
-        if (!bloom_eval(ctx->model, params.n_threads, n_past, embd, logits, ctx->mem_per_token)) {
+        if (!bloom_eval(ctx->model, params.n_threads, n_past, embd, logits, ctx->mem_per_token, logits_all)) {
             // todo: better error handling
             printf("Failed to predict\n");
             exit(1);
@@ -1082,8 +1090,8 @@ extern "C" float* eval_api(ChatContext *ctx,
                            int32_t seed,
                            int32_t n_threads,
                            int32_t n_batch,
-                           int32_t* len) {
-    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch);
+                           int64_t* len) {
+    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch, true);
     float *c_logits = (float *)malloc(sizeof(float) * logits.size());
     std::copy(logits.cbegin(), logits.cend(), c_logits);
     *len = logits.size();
