@@ -1055,14 +1055,16 @@ static std::vector<float> eval_internal(ChatContext *ctx,
     int n_past = 0;
     std::vector<gpt_vocab::id> & cached_tokens = ctx->cached_tokens;
     std::vector<gpt_vocab::id> input_tokens(tokens, tokens + token_num);
-    while (n_past < cached_tokens.size() && n_past < token_num) {
-        if (cached_tokens[n_past] == input_tokens[n_past]) {
-            ++n_past;
-        } else {
-            break;
+    if (!logits_all) {
+        while (n_past < cached_tokens.size() && n_past < token_num) {
+            if (cached_tokens[n_past] == input_tokens[n_past]) {
+                ++n_past;
+            } else {
+                break;
+            }
         }
+        n_past = std::min(n_past, token_num - 1);
     }
-    n_past = std::min(n_past, token_num - 1);
 
     printf("n_past: %d\n", n_past);
 
