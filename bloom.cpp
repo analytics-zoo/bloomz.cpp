@@ -575,7 +575,7 @@ bool bloom_eval(
 
     const int d_key = n_embd/n_head;
 
-    static size_t buf_size = 512ul*2048*2048;     // todo!
+    static size_t buf_size = 512ul*10000*10000;     // todo!
     static void * buf = malloc(buf_size);
 
     if (mem_per_token > 0 && mem_per_token*N > buf_size) {
