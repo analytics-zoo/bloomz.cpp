@@ -78,6 +78,8 @@ struct ChatContext {
     gpt_vocab vocab;
     size_t mem_per_token = 0;
     std::vector<gpt_vocab::id> cached_tokens;
+    std::vector<float> logits;
+    std::vector<float> embeddings;
 };
 
 // load the model's weights from a file
@@ -560,8 +562,10 @@ bool bloom_eval(
         const int n_past,
         const std::vector<gpt_vocab::id> & embd_inp,
               std::vector<float>         & embd_w,
+              std::vector<float>         & embeddings,
               size_t                     & mem_per_token,
-              bool logits_all = false) {
+              bool logits_all = false,
+              bool embed = false) {
 
     const int64_t N = embd_inp.size();
 
@@ -752,6 +756,9 @@ bool bloom_eval(
         inpL = cur;
     }
 
+    // used at the end to optionally extract the embeddings
+    struct ggml_tensor * embedding_tensor = NULL;
+
     // norm
     {
         inpL = ggml_norm(ctx0, inpL);
@@ -762,6 +769,8 @@ bool bloom_eval(
                     inpL);
 
         inpL = ggml_add(ctx0, ggml_repeat(ctx0, model.output_norm_b, inpL), inpL);
+
+        embedding_tensor = inpL;
     }
 
     // lm_head
@@ -793,6 +802,10 @@ bool bloom_eval(
         memcpy(embd_w.data(), (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
     }
 
+    if (embed) {
+        embeddings.resize(n_embd);
+        memcpy(embeddings.data(), (float *)ggml_get_data(embedding_tensor) + (n_embd*(N - 1)), sizeof(float)*n_embd);
+    }
 
     if (mem_per_token == 0) {
         mem_per_token = ggml_used_mem(ctx0)/N;
@@ -814,8 +827,13 @@ extern "C" ChatContext* bloom_load(const char * fname, int n_ctx, int n_threads)
     }
 
     // determine the required inference memory per token:
-    std::vector<float> logits;
-    res = bloom_eval(ctx->model, n_threads, 0, { 0, 1, 2, 3 }, logits, ctx->mem_per_token);
+    res = bloom_eval(ctx->model,
+                     n_threads,
+                     0,
+                     { 0, 1, 2, 3 },
+                     ctx->logits,
+                     ctx->embeddings,
+                     ctx->mem_per_token);
     if (!res) {
         return 0;
     }
@@ -844,7 +862,7 @@ int inference(gpt_params & params,
     size_t n_past_init = n_past;
 
     std::mt19937 rng(params.seed);
-    std::vector<float> logits;
+    std::vector<float> logits, embeddings;
 
     while (n_past < tokens.size()) {
         // eval input prompt
@@ -853,7 +871,13 @@ int inference(gpt_params & params,
         int n = std::min((size_t)params.n_batch, tokens.size() - n_past);
         std::vector<gpt_vocab::id> embd(tokens.cbegin() + n_past,
                                         tokens.cbegin() + n_past + n);
-        if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
+        if (!bloom_eval(model,
+                        params.n_threads,
+                        n_past,
+                        embd,
+                        logits,
+                        embeddings,
+                        mem_per_token)) {
             // todo: better error handling
             printf("Failed to predict\n");
             return 1;
@@ -897,7 +921,13 @@ int inference(gpt_params & params,
             const int64_t t_start_predict_us = ggml_time_us();
 
             std::vector<gpt_vocab::id> embd(1, last_n_tokens.back());
-            if (!bloom_eval(model, params.n_threads, n_past, embd, logits, mem_per_token)) {
+            if (!bloom_eval(model,
+                            params.n_threads,
+                            n_past,
+                            embd,
+                            logits,
+                            embeddings,
+                            mem_per_token)) {
                 // todo: better error handling
                 printf("Failed to predict\n");
                 return -1;
@@ -1042,12 +1072,13 @@ extern "C" char* detokenize_api(ChatContext *ctx,
     return dst;
 }
 
-static std::vector<float> eval_internal(ChatContext *ctx,
-                                        int32_t *tokens,
-                                        int32_t token_num,
-                                        int32_t n_threads,
-                                        int32_t n_batch,
-                                        bool logits_all = false) {
+static bool eval_internal(ChatContext *ctx,
+                          int32_t *tokens,
+                          int32_t token_num,
+                          int32_t n_threads,
+                          int32_t n_batch,
+                          bool logits_all = false,
+                          bool embed = false) {
     gpt_params params;
     params.n_threads = n_threads > 0 ? n_threads : params.n_threads;
     params.n_batch = n_batch > 0 ? n_batch : params.n_batch;
@@ -1068,22 +1099,29 @@ static std::vector<float> eval_internal(ChatContext *ctx,
 
     printf("n_past: %d\n", n_past);
 
-    std::vector<float> logits;
     while (n_past < input_tokens.size()) {
         // eval input prompt
         int n = std::min((size_t)params.n_batch, input_tokens.size() - n_past);
         std::vector<gpt_vocab::id> embd(input_tokens.cbegin() + n_past,
                                         input_tokens.cbegin() + n_past + n);
-        if (!bloom_eval(ctx->model, params.n_threads, n_past, embd, logits, ctx->mem_per_token, logits_all)) {
+        if (!bloom_eval(ctx->model,
+                        params.n_threads,
+                        n_past,
+                        embd,
+                        ctx->logits,
+                        ctx->embeddings,
+                        ctx->mem_per_token,
+                        logits_all,
+                        embed)) {
             // todo: better error handling
             printf("Failed to predict\n");
-            exit(1);
+            return false;
         }
         n_past += n;
     }
 
     cached_tokens.swap(input_tokens);
-    return logits;
+    return true;
 }
 
 extern "C" float* eval_api(ChatContext *ctx,
@@ -1093,11 +1131,23 @@ extern "C" float* eval_api(ChatContext *ctx,
                            int32_t n_threads,
                            int32_t n_batch,
                            int64_t* len) {
-    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch, true);
-    float *c_logits = (float *)malloc(sizeof(float) * logits.size());
-    std::copy(logits.cbegin(), logits.cend(), c_logits);
-    *len = logits.size();
-    return c_logits;
+    bool status = eval_internal(ctx, tokens, token_num, n_threads, n_batch, true);
+    assert(status);
+    *len = ctx->logits.size();
+    return ctx->logits.data();
+}
+
+extern "C" float* embed_api(ChatContext *ctx,
+                            int32_t *tokens,
+                            int32_t token_num,
+                            int32_t seed,
+                            int32_t n_threads,
+                            int32_t n_batch,
+                            int64_t* len) {
+    bool status = eval_internal(ctx, tokens, token_num, n_threads, n_batch, false, true);
+    assert(status);
+    *len = ctx->embeddings.size();
+    return ctx->embeddings.data();
 }
 
 
@@ -1107,7 +1157,8 @@ extern "C" int32_t forward_api(ChatContext *ctx,
                                int32_t seed,
                                int32_t n_threads,
                                int32_t n_batch) {
-    std::vector<float> logits = eval_internal(ctx, tokens, token_num, n_threads, n_batch);
+    bool status = eval_internal(ctx, tokens, token_num, n_threads, n_batch);
+    assert(status);
 
     gpt_params params;
     params.seed = seed < 0 ? time(NULL) : seed;
@@ -1128,7 +1179,7 @@ extern "C" int32_t forward_api(ChatContext *ctx,
     }
 
     gpt_vocab::id id = bloom_sample_top_p(ctx->vocab,
-                                          logits.data() + (logits.size() - ctx->model.hparams.n_vocab),
+                                          ctx->logits.data() + (ctx->logits.size() - ctx->model.hparams.n_vocab),
                                           last_n_tokens,
                                           params.repeat_penalty,
                                           params.top_p,
