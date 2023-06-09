@@ -14298,7 +14298,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 }
 
 void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) {
-    const int n_threads = cgraph->n_threads;
+    const int n_threads = cgraph->n_threads > 1 ? cgraph->n_threads : 2;
 
     struct ggml_compute_state_shared state_shared = {
         /*.spin      =*/ GGML_LOCK_INITIALIZER,
