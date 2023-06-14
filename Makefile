@@ -192,14 +192,17 @@ ggml.o: ggml.c ggml.h
 utils.o: utils.cpp utils.h
 	$(CXX) $(CXXFLAGS) -c utils.cpp -o utils.o
 
+bloom.o: bloom.cpp bloom.h
+	$(CXX) $(CXXFLAGS) -c bloom.cpp -o bloom.o
+
 libbloom.so: bloom.cpp ggml.o utils.o
 	$(CXX) $(CXXFLAGS) -shared -fPIC bloom.cpp ggml.o utils.o -o libbloom.so $(LDFLAGS)
 
 clean:
 	rm -f *.o *.so main quantize
 
-main: main.cpp ggml.o utils.o
-	$(CXX) $(CXXFLAGS) main.cpp ggml.o utils.o -o main $(LDFLAGS)
+main: main.cpp ggml.o utils.o bloom.o
+	$(CXX) $(CXXFLAGS) main.cpp ggml.o utils.o bloom.o -o main $(LDFLAGS)
 
 quantize: quantize.cpp ggml.o utils.o
 	$(CXX) $(CXXFLAGS) quantize.cpp ggml.o utils.o -o quantize $(LDFLAGS)

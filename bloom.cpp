@@ -1,6 +1,4 @@
-#include "ggml.h"
-
-#include "utils.h"
+#include "bloom.h"
 
 #include <cassert>
 #include <cmath>
@@ -18,61 +16,6 @@
 #include <signal.h>
 #endif
 
-struct bloom_hparams {
-    int32_t n_vocab = 32000;
-    int32_t n_ctx   = 512;   // this is provided as user input?
-    int32_t n_embd  = 4096;
-    int32_t n_mult  = 256;
-    int32_t n_head  = 32;
-    int32_t n_layer = 32;
-    int32_t f16     = 1;
-};
-
-struct bloom_layer {
-    // normalization
-    struct ggml_tensor * attention_norm;
-    struct ggml_tensor * attention_norm_b;
-
-    // attention
-    struct ggml_tensor * query_key_value;
-    struct ggml_tensor * query_key_value_b;
-    struct ggml_tensor * wo;
-    struct ggml_tensor * wo_b;
-
-    // normalization
-    struct ggml_tensor * ffn_norm;
-    struct ggml_tensor * ffn_norm_b;
-
-    // ff
-    struct ggml_tensor * w1;
-    struct ggml_tensor * w1_b;
-    struct ggml_tensor * w2;
-    struct ggml_tensor * w2_b;
-};
-
-struct bloom_model {
-    bloom_hparams hparams;
-
-    struct ggml_tensor * tok_embeddings;
-    struct ggml_tensor * norm;
-    struct ggml_tensor * norm_b;
-
-    struct ggml_tensor * output_norm;
-    struct ggml_tensor * output_norm_b;
-    struct ggml_tensor * output;
-
-
-    std::vector<bloom_layer> layers;
-
-    // key + value memory
-    struct ggml_tensor * memory_k;
-    struct ggml_tensor * memory_v;
-
-    //
-    struct ggml_context * ctx;
-    std::map<std::string, struct ggml_tensor *> tensors;
-};
-
 struct ChatContext {
     bloom_model model;
     gpt_vocab vocab;
@@ -84,11 +27,11 @@ struct ChatContext {
 
 // load the model's weights from a file
 bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab & vocab, int n_ctx) {
-    printf("%s: loading model from '%s' - please wait ...\n", __func__, fname.c_str());
+    printf("%s: loading model from '%s' - please wait ...\n", "loading bigdl-llm model", fname.c_str());
 
     auto fin = std::ifstream(fname, std::ios::binary);
     if (!fin) {
-        fprintf(stderr, "%s: failed to open '%s'\n", __func__, fname.c_str());
+        fprintf(stderr, "%s: failed to open '%s'\n", "loading bigdl-llm model", fname.c_str());
         return false;
     }
 
@@ -97,7 +40,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
         uint32_t magic;
         fin.read((char *) &magic, sizeof(magic));
         if (magic != 0x67676d6c) {
-            fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", __func__, fname.c_str());
+            fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", "loading bigdl-llm model", fname.c_str());
             return false;
         }
     }
@@ -123,15 +66,15 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
         // n_parts = BLOOM_N_PARTS.at(hparams.n_embd);
         n_parts = 1;
 
-        printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
-        printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
-        printf("%s: n_embd  = %d\n", __func__, hparams.n_embd);
-        printf("%s: n_mult  = %d\n", __func__, hparams.n_mult);
-        printf("%s: n_head  = %d\n", __func__, hparams.n_head);
-        printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
-        printf("%s: f16     = %d\n", __func__, hparams.f16);
-        printf("%s: n_ff    = %d\n", __func__, n_ff);
-        printf("%s: n_parts = %d\n", __func__, n_parts);
+        printf("%s: n_vocab = %d\n", "loading bigdl-llm model", hparams.n_vocab);
+        printf("%s: n_ctx   = %d\n", "loading bigdl-llm model", hparams.n_ctx);
+        printf("%s: n_embd  = %d\n", "loading bigdl-llm model", hparams.n_embd);
+        printf("%s: n_mult  = %d\n", "loading bigdl-llm model", hparams.n_mult);
+        printf("%s: n_head  = %d\n", "loading bigdl-llm model", hparams.n_head);
+        printf("%s: n_layer = %d\n", "loading bigdl-llm model", hparams.n_layer);
+        printf("%s: f16     = %d\n", "loading bigdl-llm model", hparams.f16);
+        printf("%s: n_ff    = %d\n", "loading bigdl-llm model", n_ff);
+        printf("%s: n_parts = %d\n", "loading bigdl-llm model", n_parts);
     }
 
     // load vocab
@@ -140,7 +83,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
 
         if (n_vocab != model.hparams.n_vocab) {
             fprintf(stderr, "%s: invalid model file '%s' (bad vocab size %d != %d)\n",
-                    __func__, fname.c_str(), n_vocab, model.hparams.n_vocab);
+                    "loading bigdl-llm model", fname.c_str(), n_vocab, model.hparams.n_vocab);
             return false;
         }
 
@@ -185,7 +128,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
         default:
                 {
                     fprintf(stderr, "%s: invalid model file '%s' (bad f16 value %d)\n",
-                            __func__, fname.c_str(), model.hparams.f16);
+                            "loading bigdl-llm model", fname.c_str(), model.hparams.f16);
                     return false;
                 }
     }
@@ -235,7 +178,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
 
         ctx_size += (5 + 10*n_layer)*256; // object overhead TODO:
 
-        printf("%s: ggml ctx size = %6.2f MB\n", __func__, ctx_size/(1024.0*1024.0));
+        printf("%s: ggml ctx size = %6.2f MB\n", "loading bigdl-llm model", ctx_size/(1024.0*1024.0));
     }
 
     // create the ggml context
@@ -247,7 +190,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
 
         model.ctx = ggml_init(params);
         if (!model.ctx) {
-            fprintf(stderr, "%s: ggml_init() failed\n", __func__);
+            fprintf(stderr, "%s: ggml_init() failed\n", "loading bigdl-llm model");
             return false;
         }
     }
@@ -334,7 +277,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
 
         const size_t memory_size = ggml_nbytes(model.memory_k) + ggml_nbytes(model.memory_v);
 
-        printf("%s: memory_size = %8.2f MB, n_mem = %d\n", __func__, memory_size/1024.0/1024.0, n_mem);
+        printf("%s: memory_size = %8.2f MB, n_mem = %d\n", "loading bigdl-llm model", memory_size/1024.0/1024.0, n_mem);
     }
 
     const size_t file_offset = fin.tellg();
@@ -352,7 +295,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
             fname_part += "." + std::to_string(i);
         }
 
-        printf("%s: loading model part %d/%d from '%s'\n", __func__, i+1, n_parts, fname_part.c_str());
+        printf("%s: loading model part %d/%d from '%s'\n", "loading bigdl-llm model", i+1, n_parts, fname_part.c_str());
 
         fin = std::ifstream(fname_part, std::ios::binary);
         fin.seekg(file_offset);
@@ -362,7 +305,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
             int n_tensors = 0;
             size_t total_size = 0;
 
-            printf("%s: ", __func__);
+            printf("%s: ", "loading bigdl-llm model");
 
             while (true) {
                 int32_t n_dims;
@@ -388,7 +331,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
                 fin.read(&name[0], length);
 
                 if (model.tensors.find(name.data()) == model.tensors.end()) {
-                    fprintf(stderr, "%s: unknown tensor '%s' in model file\n", __func__, name.data());
+                    fprintf(stderr, "%s: unknown tensor '%s' in model file\n", "loading bigdl-llm model", name.data());
                     return false;
                 }
 
@@ -537,7 +480,7 @@ bool bloom_model_load(const std::string & fname, bloom_model & model, gpt_vocab 
 
             printf(" done\n");
 
-            printf("%s: model size = %8.2f MB / num tensors = %d\n", __func__, total_size/1024.0/1024.0, n_tensors);
+            printf("%s: model size = %8.2f MB / num tensors = %d\n", "loading bigdl-llm model", total_size/1024.0/1024.0, n_tensors);
         }
 
         fin.close();
@@ -564,8 +507,8 @@ bool bloom_eval(
               std::vector<float>         & embd_w,
               std::vector<float>         & embeddings,
               size_t                     & mem_per_token,
-              bool logits_all = false,
-              bool embed = false) {
+              bool logits_all,
+              bool embed) {
 
     const int64_t N = embd_inp.size();
 
@@ -1010,7 +953,7 @@ extern "C" int bloom_run(ChatContext *ctx,
             }
         }
         n_past = std::min(n_past, (int)input_tokens.size() - 1);
-        printf("n_past: %d\n", n_past);
+        // printf("n_past: %d\n", n_past);
 
         cached_tokens.swap(input_tokens);
     }
@@ -1097,7 +1040,7 @@ static bool eval_internal(ChatContext *ctx,
         n_past = std::min(n_past, token_num - 1);
     }
 
-    printf("n_past: %d\n", n_past);
+    // printf("n_past: %d\n", n_past);
 
     while (n_past < input_tokens.size()) {
         // eval input prompt

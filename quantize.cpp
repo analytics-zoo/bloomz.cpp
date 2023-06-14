@@ -82,13 +82,13 @@ bool bloom_model_quantize(const std::string & fname_inp, const std::string & fna
         finp.read((char *) &hparams.n_layer, sizeof(hparams.n_layer));
         finp.read((char *) &hparams.f16,     sizeof(hparams.f16));
 
-        printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
-        printf("%s: n_ctx   = %d\n", __func__, hparams.n_ctx);
-        printf("%s: n_embd  = %d\n", __func__, hparams.n_embd);
-        printf("%s: n_mult  = %d\n", __func__, hparams.n_mult);
-        printf("%s: n_head  = %d\n", __func__, hparams.n_head);
-        printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
-        printf("%s: f16     = %d\n", __func__, hparams.f16);
+        printf("%s: n_vocab = %d\n", "bigdl-llm quantize", hparams.n_vocab);
+        printf("%s: n_ctx   = %d\n", "bigdl-llm quantize", hparams.n_ctx);
+        printf("%s: n_embd  = %d\n", "bigdl-llm quantize", hparams.n_embd);
+        printf("%s: n_mult  = %d\n", "bigdl-llm quantize", hparams.n_mult);
+        printf("%s: n_head  = %d\n", "bigdl-llm quantize", hparams.n_head);
+        printf("%s: n_layer = %d\n", "bigdl-llm quantize", hparams.n_layer);
+        printf("%s: f16     = %d\n", "bigdl-llm quantize", hparams.f16);
 
         fout.write((char *) &hparams.n_vocab, sizeof(hparams.n_vocab));
         //fout.write((char *) &hparams.n_ctx,   sizeof(hparams.n_ctx));
@@ -259,8 +259,8 @@ bool bloom_model_quantize(const std::string & fname_inp, const std::string & fna
             total_size_org += nelements * sizeof(float);
         }
 
-        printf("%s: model size  = %8.2f MB\n", __func__, total_size_org/1024.0/1024.0);
-        printf("%s: quant size  = %8.2f MB\n", __func__, total_size_new/1024.0/1024.0);
+        printf("%s: model size  = %8.2f MB\n", "bigdl-llm quantize", total_size_org/1024.0/1024.0);
+        printf("%s: quant size  = %8.2f MB\n", "bigdl-llm quantize", total_size_new/1024.0/1024.0);
 
         {
             int64_t sum_all = 0;
@@ -268,7 +268,7 @@ bool bloom_model_quantize(const std::string & fname_inp, const std::string & fna
                 sum_all += hist_all[i];
             }
 
-            printf("%s: hist: ", __func__);
+            printf("%s: hist: ", "bigdl-llm quantize");
             for (int i = 0; i < hist_all.size(); ++i) {
                 printf("%5.3f ", hist_all[i] / (float)sum_all);
             }
