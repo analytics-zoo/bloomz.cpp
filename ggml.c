@@ -2424,7 +2424,7 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float * restrict s, const void *
     // Main loop
     for (int i = 0; i < nb; ++i) {
         /* Compute combined scale for the block */
-        const __m256 d = _mm256_set1_ps( x[i].d * y[i].d);
+        const __m256 d = _mm256_set1_ps(x[i].d * y[i].d);
 
         for (int j = 0; j < QK4_0 / 32; ++j) {
             const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
@@ -3357,25 +3357,77 @@ static void ggml_vec_dot_q8_0_q8_0(const int n, float * restrict s, const void *
     }
 
     *s = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
-#elif defined(__AVX2__) || defined(__AVX__)
+#elif defined(__AVX512F__)
+    // Initialize accumulator with zeros
+    __m512 acc = _mm512_setzero_ps();
+
+    const __m512i zeros = _mm512_setzero_epi32();
+    const __m512i ones = _mm512_set1_epi16(1);
+    // Main loop
+    for (int i = 0; i < nb; ++i) {
+        // /* Compute combined scale for the block */
+        const __m512 d = _mm512_set1_ps(x[i].d * y[i].d);
+
+        const __m512i bx = _mm512_loadu_si512((const __m512i *)x[i].qs);
+        const __m512i by = _mm512_loadu_si512((const __m512i *)y[i].qs);
+
+        // xy_q[0] :i32 = sum( bx[i] * by[i] ) i:0->3
+        const __m512i ax = _mm512_abs_epi8(bx);
+        const __mmask64 lt_zero_mask = _mm512_cmp_epi8_mask(bx, zeros, _MM_CMPINT_LT);
+        const __m512i sy = _mm512_mask_sub_epi8(by, lt_zero_mask, zeros, by);
+#ifdef __AVX512VNNI__
+        const __m512i xy_q = _mm512_dpbusd_epi32(zeros, ax, sy);
+#else
+        const __m512i dot = _mm512_maddubs_epi16(ax, sy);
+        const __m512i xy_q = _mm512_madd_epi16(ones, dot);
+#endif
+        /* Convert to vectore of 8 int32_t to 8 floats */
+        const __m512 q = _mm512_cvtepi32_ps( xy_q );
+
+        /* Multiply q with scale and accumulate */
+        acc = _mm512_fmadd_ps( d, q, acc );
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
+    const __m256i zeros = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
     // Main loop
     for (int i = 0; i < nb; ++i) {
-        // Compute combined scale for the block
-        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * GGML_FP16_TO_FP32(y[i].d));
-        __m256i bx = _mm256_loadu_si256((const __m256i *)x[i].qs);
-        __m256i by = _mm256_loadu_si256((const __m256i *)y[i].qs);
+        /* Compute combined scale for the block */
+        const __m256 d = _mm256_set1_ps(x[i].d * y[i].d);
 
-        const __m256 q = mul_sum_i8_pairs_float(bx, by);
+        for (int j = 0; j < QK4_0 / 32; ++j) {
+            const __m256i bx = _mm256_lddqu_si256((const __m256i *)(x[i].qs + 32*j));
+            const __m256i by = _mm256_lddqu_si256((const __m256i *)(y[i].qs + 32*j));
+#if defined(__AVXVNNIINT8__)
+            const __m256i xy_q = _mm256_dpbssd_epi32(zeros, bx, by);
+#elif defined(__AVXVNNI__)
+            // Get absolute values of x vectors
+            const __m256i ax = _mm256_sign_epi8(bx, bx);
+            // Sign the values of the y vectors
+            const __m256i sy = _mm256_sign_epi8(by, bx);
 
-        // Multiply q with scale and accumulate
-#if defined(__AVX2__)
-        acc = _mm256_fmadd_ps( d, q, acc );
+            const __m256i xy_q = _mm256_dpbusd_epi32(zeros, ax, sy);
 #else
-        acc = _mm256_add_ps( _mm256_mul_ps( d, q ), acc );
+            // Get absolute values of x vectors
+            const __m256i ax = _mm256_sign_epi8(bx, bx);
+            // Sign the values of the y vectors
+            const __m256i sy = _mm256_sign_epi8(by, bx);
+
+            // Perform multiplication and create 16-bit values
+            const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+            const __m256i xy_q = _mm256_madd_epi16(ones, dot);
 #endif
+            /* Convert to vectore of 8 int32_t to 8 floats */
+            const __m256 q = _mm256_cvtepi32_ps( xy_q );
+
+            /* Multiply q with scale and accumulate */
+            acc = _mm256_fmadd_ps( d, q, acc );
+        }
     }
 
     *s = hsum_float_8(acc);
