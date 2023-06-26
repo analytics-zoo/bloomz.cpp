@@ -5,11 +5,11 @@
 #include <fstream>
 #include <regex>
 
- #if defined(_MSC_VER) || defined(__MINGW32__)
- #include <malloc.h> // using malloc.h with MSC/MINGW
- #elif !defined(__FreeBSD__) && !defined(__NetBSD__)
- #include <alloca.h>
- #endif
+#if defined(_MSC_VER) || defined(__MINGW32__)
+#include <malloc.h> // using malloc.h with MSC/MINGW
+#elif !defined(__FreeBSD__) && !defined(__NetBSD__)
+#include <alloca.h>
+#endif
 
 bool gpt_params_parse(int argc, char ** argv, gpt_params & params) {
     for (int i = 1; i < argc; i++) {
@@ -521,10 +521,78 @@ gpt_vocab::id bloom_sample_top_p(
     return logits_id[idx].second;
 }
 
+typedef uint16_t ggml_fp16_t;
+
+static inline float fp32_from_bits(uint32_t w) {
+    union {
+        uint32_t as_bits;
+        float as_value;
+    } fp32;
+    fp32.as_bits = w;
+    return fp32.as_value;
+}
+
+static inline uint32_t fp32_to_bits(float f) {
+    union {
+        float as_value;
+        uint32_t as_bits;
+    } fp32;
+    fp32.as_value = f;
+    return fp32.as_bits;
+}
+
+static inline float ggml_compute_fp16_to_fp32(ggml_fp16_t h) {
+    const uint32_t w = (uint32_t) h << 16;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    const uint32_t two_w = w + w;
+
+    const uint32_t exp_offset = UINT32_C(0xE0) << 23;
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || defined(__GNUC__) && !defined(__STRICT_ANSI__)
+    const float exp_scale = 0x1.0p-112f;
+#else
+    const float exp_scale = fp32_from_bits(UINT32_C(0x7800000));
+#endif
+    const float normalized_value = fp32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+
+    const uint32_t magic_mask = UINT32_C(126) << 23;
+    const float magic_bias = 0.5f;
+    const float denormalized_value = fp32_from_bits((two_w >> 17) | magic_mask) - magic_bias;
+
+    const uint32_t denormalized_cutoff = UINT32_C(1) << 27;
+    const uint32_t result = sign |
+        (two_w < denormalized_cutoff ? fp32_to_bits(denormalized_value) : fp32_to_bits(normalized_value));
+    return fp32_from_bits(result);
+}
+
+static inline ggml_fp16_t ggml_compute_fp32_to_fp16(float f) {
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) || defined(__GNUC__) && !defined(__STRICT_ANSI__)
+    const float scale_to_inf = 0x1.0p+112f;
+    const float scale_to_zero = 0x1.0p-110f;
+#else
+    const float scale_to_inf = fp32_from_bits(UINT32_C(0x77800000));
+    const float scale_to_zero = fp32_from_bits(UINT32_C(0x08800000));
+#endif
+    float base = (fabsf(f) * scale_to_inf) * scale_to_zero;
+
+    const uint32_t w = fp32_to_bits(f);
+    const uint32_t shl1_w = w + w;
+    const uint32_t sign = w & UINT32_C(0x80000000);
+    uint32_t bias = shl1_w & UINT32_C(0xFF000000);
+    if (bias < UINT32_C(0x71000000)) {
+        bias = UINT32_C(0x71000000);
+    }
+
+    base = fp32_from_bits((bias >> 1) + UINT32_C(0x07800000)) + base;
+    const uint32_t bits = fp32_to_bits(base);
+    const uint32_t exp_bits = (bits >> 13) & UINT32_C(0x00007C00);
+    const uint32_t mantissa_bits = bits & UINT32_C(0x00000FFF);
+    const uint32_t nonsign = exp_bits + mantissa_bits;
+    return (sign >> 16) | (shl1_w > UINT32_C(0xFF000000) ? UINT16_C(0x7E00) : nonsign);
+}
 
 size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk, int64_t * hist) {
     const int64_t nb = k / qk;
-    const size_t bs = (sizeof(float) + sizeof(uint8_t)*qk/2);
+    const size_t bs = (sizeof(ggml_fp16_t) + sizeof(uint8_t)*qk/2);
     const size_t row_size = nb*bs;
 
     assert(k % qk == 0);
@@ -536,7 +604,7 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk,
 
     for (int64_t j = 0; j < n; j += k) {
         uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
-        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + sizeof(float));
+        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + sizeof(ggml_fp16_t));
 
         for (int64_t i = 0; i < nb; i++) {
             float amax = 0.0f; // absolute max
@@ -553,7 +621,7 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk,
             const float d = max / -8;
             const float id = d ? 1.0f/d : 0.0f;
 
-            *(float *) pd = d;
+            *(ggml_fp16_t *) pd = ggml_compute_fp32_to_fp16(d);
             pd += bs;
 
             for (int l = 0; l < qk/2; ++l) {
@@ -578,8 +646,9 @@ size_t ggml_quantize_q4_0(float * src, void * dst, int64_t n, int64_t k, int qk,
 }
 
 size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t * hist) {
-    const int nb = k / qk;
-    const size_t row_size = nb*(2*sizeof(float) + sizeof(uint8_t)*qk/2);
+    const int64_t nb = k / qk;
+    const size_t bs = (2*sizeof(ggml_fp16_t) + sizeof(uint8_t)*qk/2);
+    const size_t row_size = nb*bs;
 
     assert(k % qk == 0);
 
@@ -589,9 +658,9 @@ size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t
     char * pdst = (char *) dst;
 
     for (int j = 0; j < n; j += k) {
-        float   * pm = (float *)   (pdst + (j/k)*row_size);
-        float   * pd = (float *)   (pm + nb);
-        uint8_t * pb = (uint8_t *) (pd + nb);
+        uint8_t * pd = (uint8_t *) (pdst + (j/k)*row_size + 0*bs);
+        uint8_t * pm = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + sizeof(ggml_fp16_t));
+        uint8_t * pb = (uint8_t *) (pdst + (j/k)*row_size + 0*bs + 2*sizeof(ggml_fp16_t));
 
         //printf("n = %d, k = %d, nb = %d, row_size = %d, j = %d, pm = %p, pd = %p, pb = %p\n", n, k, nb, row_size, j, pm, pd, pb);
 
@@ -599,37 +668,35 @@ size_t ggml_quantize_q4_1(float * src, void * dst, int n, int k, int qk, int64_t
             float min = std::numeric_limits<float>::max();
             float max = std::numeric_limits<float>::min();
 
-            {
-                for (int l = 0; l < qk; l++) {
-                    const float v = src[j + i*qk + l];
-                    if (v < min) min = v;
-                    if (v > max) max = v;
-                }
-
-                const float d = (max - min) / ((1 << 4) - 1);
-                const float id = d ? 1.0f/d : 0.0f;
-
-                pm[i] = min;
-                pd[i] = d;
-
-                for (int l = 0; l < qk; l += 2) {
-                    const float v0 = (src[j + i*qk + l + 0] - min)*id;
-                    const float v1 = (src[j + i*qk + l + 1] - min)*id;
-
-                    const uint8_t vi0 = round(v0);
-                    const uint8_t vi1 = round(v1);
-
-                    assert(vi0 >= 0 && vi0 < 16);
-                    assert(vi1 >= 0 && vi1 < 16);
-
-                    hist[vi0]++;
-                    hist[vi1]++;
-
-                    pp[l/2] = vi0 | (vi1 << 4);
-                }
-
-                memcpy(pb + i*qk/2, pp, pp_size);
+            for (int l = 0; l < qk; l++) {
+                const float v = src[j + i*qk + l];
+                if (v < min) min = v;
+                if (v > max) max = v;
             }
+
+            const float d = (max - min) / ((1 << 4) - 1);
+            const float id = d ? 1.0f/d : 0.0f;
+
+            *(ggml_fp16_t *) pd = ggml_compute_fp32_to_fp16(d);
+            *(ggml_fp16_t *) pm = ggml_compute_fp32_to_fp16(min);
+            pd += bs;
+            pm += bs;
+
+            for (int l = 0; l < qk/2; ++l) {
+                const float x0 = (src[j + i*qk + 0    + l] - min)*id;
+                const float x1 = (src[j + i*qk + qk/2 + l] - min)*id;
+
+                const uint8_t vi0 = std::min((int8_t)15, (int8_t)(x0 + 0.5f));
+                const uint8_t vi1 = std::min((int8_t)15, (int8_t)(x1 + 0.5f));
+
+                hist[vi0]++;
+                hist[vi1]++;
+
+                pp[l] = vi0 | (vi1 << 4);
+            }
+
+            memcpy(pb, pp, pp_size);
+            pb += bs;
         }
     }
 

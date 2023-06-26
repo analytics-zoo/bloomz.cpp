@@ -22,7 +22,7 @@
 #include <limits.h>
 
 int64_t op_time[50];
-int64_t thread_time[48];
+int64_t thread_time[128];
 
 // if C99 - static_assert is noop
 // ref: https://stackoverflow.com/a/53923785/4039976
@@ -787,10 +787,10 @@ inline static int32x4_t vcvtnq_s32_f32(float32x4_t v) {
 #define QK4_0 32
 #endif
 typedef struct {
-    float d;          // delta
+    ggml_fp16_t d;          // delta
     uint8_t qs[QK4_0 / 2];  // nibbles / quants
 } block_q4_0;
-static_assert(sizeof(block_q4_0) == sizeof(float) + QK4_0 / 2, "wrong q4_0 block size/padding");
+static_assert(sizeof(block_q4_0) == sizeof(ggml_fp16_t) + QK4_0 / 2, "wrong q4_0 block size/padding");
 
 #if defined(__AVX512F__) || defined(__AVX2__)
 #define QK4_1 64
@@ -844,8 +844,8 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(float) + QK8_1, "wrong q8_1 block size/padding");
 
-static_assert(QK4_0 == QK4_1, "QK4_0 must be equal to QK4_1");
-static_assert(QK4_0 == QK8_0, "QK4_0 must be equal to QK8_0");
+static_assert(QK4_0 == QK8_1, "QK4_0 must be equal to QK8_1");
+static_assert(QK4_1 == QK8_1, "QK4_1 must be equal to QK8_1");
 static_assert(QK4_0 == 64, "QK4_0 must be equal to 64");
 
 // reference implementation for deterministic creation of model files
@@ -871,7 +871,7 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
         const float d  = max / -8;
         const float id = d ? 1.0f/d : 0.0f;
 
-        y[i].d = d;
+        y[i].d = GGML_FP32_TO_FP16(d);
 
         for (int j = 0; j < qk/2; ++j) {
             const float x0 = x[i*qk + 0    + j]*id;
@@ -1540,7 +1540,7 @@ static void dequantize_row_q4_0(const block_q4_0 * restrict x, float * restrict 
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
-        const float d = x[i].d;
+        const float d = GGML_FP16_TO_FP32(x[i].d);
 
         for (int j = 0; j < qk/2; ++j) {
             const int x0 = (x[i].qs[j] & 0x0F) - 8;
@@ -1645,6 +1645,7 @@ static void dequantize_row_q8_0(const void * restrict vx, float * restrict y, in
 }
 
 static void ggml_vec_dot_q4_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy);
+static void ggml_vec_dot_q4_0_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy);
 static void ggml_vec_dot_q4_1_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy);
 static void ggml_vec_dot_q5_0_q8_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy);
 static void ggml_vec_dot_q5_1_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy);
@@ -1655,9 +1656,9 @@ static const quantize_fns_t quantize_fns[GGML_TYPE_COUNT] = {
         .dequantize_row_q         = (dequantize_row_q_t) dequantize_row_q4_0,
         .quantize_row_q           = quantize_row_q4_0,
         .quantize_row_q_reference = (quantize_row_q_t) quantize_row_q4_0_reference,
-        .quantize_row_q_dot       = quantize_row_q8_0,
-        .vec_dot_q                = ggml_vec_dot_q4_0_q8_0,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .quantize_row_q_dot       = quantize_row_q8_1,
+        .vec_dot_q                = ggml_vec_dot_q4_0_q8_1,
+        .vec_dot_type             = GGML_TYPE_Q8_1,
     },
     [GGML_TYPE_Q4_1] = {
         .dequantize_row_q         = (dequantize_row_q_t)dequantize_row_q4_1,
@@ -2385,7 +2386,7 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float * restrict s, const void *
     // Main loop
     for (int i = 0; i < nb; ++i) {
         // /* Compute combined scale for the block */
-        const __m512 d = _mm512_set1_ps(x[i].d * y[i].d);
+        const __m512 d = _mm512_set1_ps(GGML_FP16_TO_FP32(x[i].d) * y[i].d);
 
         const __m512i bx = dequantize_64x4_2_64x8(x[i].qs);
         const __m512i by = _mm512_loadu_si512((const __m512i *)y[i].qs);
@@ -2424,10 +2425,10 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float * restrict s, const void *
     // Main loop
     for (int i = 0; i < nb; ++i) {
         /* Compute combined scale for the block */
-        const __m256 d = _mm256_set1_ps(x[i].d * y[i].d);
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * y[i].d);
+        const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
 
         for (int j = 0; j < QK4_0 / 32; ++j) {
-            const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
             const __m256i bx = _mm256_and_si256(_mm256_srli_epi16(bx_64x4, j*4), mask);
             const __m256i by = _mm256_lddqu_si256((const __m256i *)(y[i].qs + 32*j));
 #if defined(__AVXVNNIINT8__)
@@ -2632,6 +2633,93 @@ static void ggml_vec_dot_q4_0_q8_0(const int n, float * restrict s, const void *
 #endif
 }
 
+static void ggml_vec_dot_q4_0_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
+    const int qk = QK8_1;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nb % 2 == 0);
+
+    const block_q4_0 * restrict x = vx;
+    const block_q8_1 * restrict y = vy;
+
+#if defined(__AVX512F__)
+    // Initialize accumulator with zeros
+    __m512 acc = _mm512_setzero_ps();
+    float off_acc = 0.0f;
+
+#ifdef __AVX512VNNI__
+    const __m512i zeros = _mm512_setzero_epi32();
+#else
+    const __m512i ones = _mm512_set1_epi16(1);
+#endif
+
+    // Main loop
+    for (int i = 0; i < nb; ++i) {
+        /* Compute combined scale for the block */
+        const float xd = GGML_FP16_TO_FP32(x[i].d);
+        const __m512 d = _mm512_set1_ps(xd * y[i].d);
+        off_acc += xd * y[i].s;
+
+        const __m512i bx = dequantize_64x4_2_64x8(x[i].qs);
+        const __m512i by = _mm512_loadu_si512((const __m512i *)y[i].qs);
+
+        // xy_q[0] :i32 = sum( (bx[i] - 8) * by[i] ) i :0->3
+#ifdef __AVX512VNNI__
+        const __m512i xy_q = _mm512_dpbusd_epi32(zeros, bx, by);
+#else
+        const __m512i dot = _mm512_maddubs_epi16(bx, by);
+        const __m512i xy_q = _mm512_madd_epi16(ones, dot);
+#endif
+        /* Convert to vectore of 8 int32_t to 8 floats */
+        const __m512 q = _mm512_cvtepi32_ps( xy_q );
+
+        /* Multiply q with scale and accumulate */
+        acc = _mm512_fmadd_ps( d, q, acc );
+    }
+
+    *s = _mm512_reduce_add_ps(acc) - 8 * off_acc;
+#elif defined(__AVX2__)
+    // Initialize accumulator with zeros
+    __m256 acc = _mm256_setzero_ps();
+    float off_acc = 0.0f;
+
+    const __m256i mask = _mm256_set1_epi8(0xF);
+#ifdef __AVXVNNI__
+    const __m256i zeros = _mm256_setzero_si256();
+#else
+    const __m256i ones = _mm256_set1_epi16(1);
+#endif
+
+    // Main loop
+    for (int i = 0; i < nb; ++i) {
+        /* Compute combined scale for the block */
+        const float xd = GGML_FP16_TO_FP32(x[i].d);
+        const __m256 d = _mm256_set1_ps(xd * y[i].d);
+        const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
+        off_acc += xd * y[i].s;
+
+        for (int j = 0; j < QK4_0 / 32; ++j) {
+            const __m256i bx = _mm256_and_si256(_mm256_srli_epi16(bx_64x4, j*4), mask);
+            const __m256i by = _mm256_lddqu_si256((const __m256i *)(y[i].qs + 32*j));
+#ifdef __AVXVNNI__
+            const __m256i xy_q = _mm256_dpbusd_epi32(zeros, bx, by);
+#else
+            const __m256i dot = _mm256_maddubs_epi16(bx, by);
+            const __m256i xy_q = _mm256_madd_epi16(ones, dot);
+#endif
+            /* Convert to vectore of 8 int32_t to 8 floats */
+            const __m256 q = _mm256_cvtepi32_ps( xy_q );
+
+            /* Multiply q with scale and accumulate */
+            acc = _mm256_fmadd_ps( d, q, acc );
+        }
+    }
+
+    *s = hsum_float_8(acc) - 8 * off_acc;
+#endif
+}
+
 static void ggml_vec_dot_q4_1_q8_1(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
     const int qk = QK8_1;
     const int nb = n / qk;
@@ -2749,32 +2837,32 @@ static void ggml_vec_dot_q4_1_q8_1(const int n, float * restrict s, const void *
 
     float summs = 0;
     const __m256i mask = _mm256_set1_epi8(0xF);
+#ifdef __AVXVNNI__
+    const __m256i zeros = _mm256_setzero_si256();
+#else
     const __m256i ones = _mm256_set1_epi16(1);
+#endif
 
     // Main loop
     for (int i = 0; i < nb; ++i) {
-        const float d0 = GGML_FP16_TO_FP32(x[i].d);
-        const float d1 = y[i].d;
+        const __m256 d = _mm256_set1_ps(GGML_FP16_TO_FP32(x[i].d) * y[i].d);
+        const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
 
         summs += GGML_FP16_TO_FP32(x[i].m) * y[i].s;
 
-        const __m256 d0v = _mm256_set1_ps( d0 );
-        const __m256 d1v = _mm256_set1_ps( d1 );
-
-        // Compute combined scales
-        const __m256 d0d1 = _mm256_mul_ps( d0v, d1v );
-
-        // Load 16 bytes, and unpack 4 bit fields into bytes, making 32 bytes
         for (int j = 0; j < QK4_0 / 32; ++j) {
-            const __m256i bx_64x4 = _mm256_lddqu_si256((const __m256i *)x[i].qs);
             const __m256i bx = _mm256_and_si256(_mm256_srli_epi16(bx_64x4, j*4), mask);
             const __m256i by = _mm256_lddqu_si256((const __m256i *)(y[i].qs + 32*j));
+#ifdef __AVXVNNI__
+            const __m256i xy_q = _mm256_dpbusd_epi32(zeros, bx, by);
+#else
             const __m256i dot = _mm256_maddubs_epi16(bx, by);
-
             const __m256i xy_q = _mm256_madd_epi16(ones, dot);
+#endif
             const __m256 xy = _mm256_cvtepi32_ps( xy_q );
+
             // Accumulate d0*d1*x*y
-            acc = _mm256_fmadd_ps( d0d1, xy, acc );
+            acc = _mm256_fmadd_ps( d, xy, acc );
         }
     }
 
@@ -10345,7 +10433,7 @@ static void ggml_compute_forward_mul_mat(
         const struct ggml_tensor * src0,
         const struct ggml_tensor * src1,
         struct ggml_tensor * dst) {
-    int64_t st = ggml_time_us();
+    // int64_t st = ggml_time_us();
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
@@ -10370,11 +10458,11 @@ static void ggml_compute_forward_mul_mat(
                 GGML_ASSERT(false);
             } break;
     }
-    if (params->type == GGML_TASK_INIT) {
-        thread_time[47] += ggml_time_us() - st;
-    } else {
-        thread_time[params->ith] += ggml_time_us() - st;
-    }
+    // if (params->type == GGML_TASK_INIT) {
+    //     thread_time[47] += ggml_time_us() - st;
+    // } else {
+    //     thread_time[params->ith] += ggml_time_us() - st;
+    // }
 }
 
 // ggml_compute_forward_scale
@@ -14306,6 +14394,8 @@ static int ggml_thread_create(pthread_t *thread,
 }
 #endif
 
+#define DYNAMIC_SCHEDULE 1
+#define N_TASKS_MUL_MAT 128
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
 
@@ -14327,11 +14417,17 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         if (state->node) {
-            if (state->params.ith < state->params.nth) {
-                ggml_compute_forward(&state->params, state->node);
+            if (DYNAMIC_SCHEDULE && state->node->op == GGML_OP_MUL_MAT) {
+                while ((state->params.ith = atomic_fetch_add(&state->shared->n_done, 1)) < N_TASKS_MUL_MAT) {
+                    ggml_compute_forward(&state->params, state->node);
+                }
+            } else {
+                if (state->params.ith < state->params.nth) {
+                    ggml_compute_forward(&state->params, state->node);
+                }
+                state->node = NULL;
+                atomic_fetch_add(&state->shared->n_done, 1);
             }
-            state->node = NULL;
-            atomic_fetch_add(&state->shared->n_done, 1);
 #ifdef __linux__
             while(!atomic_load_explicit(&state->shared->finish, memory_order_relaxed)) {
 #else
@@ -14455,7 +14551,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
                     } break;
                 case GGML_OP_MUL_MAT:
                     {
-                        node->n_tasks = n_threads - 1;
+                        node->n_tasks = DYNAMIC_SCHEDULE ? N_TASKS_MUL_MAT : n_threads - 1;
 
                         // TODO: use different scheduling for different matrix sizes
                         //const int nr0 = ggml_nrows(node->src0);
@@ -14636,7 +14732,7 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
         }
 
         if (work_size > 0 && cgraph->work == NULL) {
-            cgraph->work_size = work_size + CACHE_LINE_SIZE*(n_threads - 1);
+            cgraph->work_size = work_size + CACHE_LINE_SIZE*(DYNAMIC_SCHEDULE ? N_TASKS_MUL_MAT : n_threads - 1);
 
             GGML_PRINT_DEBUG("%s: allocating work buffer for graph (%zu bytes)\n", __func__, cgraph->work_size);
             cgraph->work = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, cgraph->work_size);
@@ -14703,14 +14799,29 @@ void ggml_graph_compute(struct ggml_context * ctx, struct ggml_cgraph * cgraph) 
             // }
 
             // wait for thread pool
+            if (DYNAMIC_SCHEDULE && node->op == GGML_OP_MUL_MAT) {
+                // compute
+                params.type = GGML_TASK_COMPUTE;
+                while ((params.ith = atomic_fetch_add(&state_shared.n_done, 1)) < N_TASKS_MUL_MAT) {
+                    ggml_compute_forward(&params, node);
+                }
 #ifdef __linux__
-            while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) < node->n_tasks) {
+                while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) < N_TASKS_MUL_MAT + n_threads) {
 #else
-            while (atomic_load(&state_shared.n_done) < node->n_tasks) {
+                while (atomic_load(&state_shared.n_done) < N_TASKS_MUL_MAT + n_threads) {
 #endif
-                // wait
-                // ggml_lock_lock(&state_shared.spin);
-                // ggml_lock_unlock(&state_shared.spin);
+                }
+                atomic_store(&state_shared.n_done, n_threads - 1);
+            } else {
+#ifdef __linux__
+                while (atomic_load_explicit(&state_shared.n_done, memory_order_relaxed) < node->n_tasks) {
+#else
+                while (atomic_load(&state_shared.n_done) < node->n_tasks) {
+#endif
+                    // wait
+                    // ggml_lock_lock(&state_shared.spin);
+                    // ggml_lock_unlock(&state_shared.spin);
+                }
             }
             atomic_store(&state_shared.start, false);
             atomic_store(&state_shared.finish, true);
