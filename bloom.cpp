@@ -522,10 +522,10 @@ bool bloom_eval(
 
     const int d_key = n_embd/n_head;
 
-    static size_t buf_size = 512ul*10000*10000;     // todo!
+    static size_t buf_size = 2ul*1024*1024*1024;     // todo!
     static void * buf = malloc(buf_size);
 
-    if (mem_per_token > 0 && mem_per_token*N > buf_size) {
+    if (mem_per_token > 0 && 1.1*(mem_per_token*N) > buf_size) {
         const size_t buf_size_new = 1.1*(mem_per_token*N); // add 10% to account for ggml object overhead
         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
