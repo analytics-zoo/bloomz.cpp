@@ -741,8 +741,8 @@ bool bloom_eval(
         embd_w.resize(n_vocab);
         memcpy(embd_w.data(), (float *) ggml_get_data(inpL) + (n_vocab*(N-1)), sizeof(float)*n_vocab);
     } else {
-        embd_w.resize(n_vocab * N);
-        memcpy(embd_w.data(), (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+        embd_w.resize(n_vocab * (n_past + N));
+        memcpy(embd_w.data() + n_vocab * n_past, (float *) ggml_get_data(inpL), sizeof(float)*n_vocab*N);
     }
 
     if (embed) {
